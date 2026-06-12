@@ -1,0 +1,10 @@
+venv/
+models/
+.env
+out/
+third_party/
+__pycache__/
+*.pyc
+.tmp/
+overnight_setup.log
+*.log
