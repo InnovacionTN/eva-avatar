@@ -243,7 +243,7 @@ class PhonemeScheduler:
                 continue
             # narrow window: influence dies off between phones so the mouth
             # visibly relaxes between syllables instead of holding open
-            center, half = 0.5 * (start + b), max(15.0, 0.40 * (b - start))
+            center, half = 0.5 * (start + b), max(12.0, 0.32 * (b - start))
             w = math.exp(-0.5 * ((t_ms - center) / half) ** 2)
             raw[v] = max(raw[v], w)
         # a bilabial closure must beat neighboring vowels, never blend away
@@ -257,7 +257,7 @@ class PhonemeScheduler:
             raw = {k: v / s for k, v in raw.items()}
         out = {}
         for v in VISEME_NAMES:
-            alpha = 0.70 if raw[v] > prev[v] else 0.38  # attack / release
+            alpha = 0.85 if raw[v] > prev[v] else 0.50  # attack / release
             step = np.clip(alpha * (raw[v] - prev[v]), -0.18, 0.18)
             out[v] = prev[v] + float(step)
         with self._lock:
@@ -535,6 +535,11 @@ class EvaRenderer:
         self.t0 = time.time()
         self.next_blink = self.t0 + random.uniform(1.5, 3.0)
         self.blink_t = None
+        # speech expressiveness: energy-scaled sway + micro-nods + eye widening
+        self.energy = 0.0
+        self.nod_t = None
+        self.widen_t = None
+        self.last_emph = 0.0
         warm = self.frame(0.0)  # build engines' first-run kernels before going live
         print(f"[init] avatar ready ({warm.shape[1]}x{warm.shape[0]})")
 
@@ -578,9 +583,34 @@ class EvaRenderer:
         s = self.x_s_info
         tnow = time.time() - self.t0
 
-        dyaw = self.sway * (2.0 * np.sin(2 * np.pi * tnow / 8.7) + 0.7 * np.sin(2 * np.pi * tnow / 3.1))
-        dpitch = self.sway * 1.1 * np.sin(2 * np.pi * tnow / 6.3)
+        # speech energy follows the lip level (fast up, slow down)
+        target = lip_level if speaking else 0.0
+        self.energy += (target - self.energy) * (0.5 if target > self.energy else 0.06)
+        e = min(1.0, self.energy)
+
+        # while she talks the head gets livelier; an extra quick component
+        # tied to energy reads as natural speaking emphasis
+        amp = 1.0 + 0.5 * e
+        dyaw = self.sway * amp * (2.0 * np.sin(2 * np.pi * tnow / 8.7) + 0.7 * np.sin(2 * np.pi * tnow / 3.1))
+        dpitch = self.sway * amp * 1.1 * np.sin(2 * np.pi * tnow / 6.3)
         droll = self.sway * 0.6 * np.sin(2 * np.pi * tnow / 11.2)
+        dyaw += self.sway * 0.6 * e * np.sin(2 * np.pi * tnow / 1.9)
+        dpitch += self.sway * 0.4 * e * np.sin(2 * np.pi * tnow / 1.4)
+
+        # phrase emphasis: strong syllable after a gap -> micro-nod or eye widen
+        now_t = time.time()
+        if speaking and lip_level > 0.45 and now_t - self.last_emph > 1.4:
+            self.last_emph = now_t
+            if random.random() < 0.65:
+                self.nod_t = now_t
+            else:
+                self.widen_t = now_t
+        if self.nod_t is not None:
+            p = (now_t - self.nod_t) / 0.38
+            if p >= 1.0:
+                self.nod_t = None
+            else:
+                dpitch += self.sway * 0.9 * np.sin(np.pi * p)  # down-and-back nod
 
         # smile eases in when she's quiet, eases mostly out while she talks
         now = time.time()
@@ -608,9 +638,15 @@ class EvaRenderer:
             lip_delta = self.pipe.retarget_lip(self.x_s, comb_lip)
             x_d = x_d + lip_delta.reshape(-1, self.x_s.shape[1], 3)
 
-        blink = self._blink_ratio(time.time(), speaking)
-        if blink is not None:
-            comb_eye = self.pipe.calc_combined_eye_ratio([[blink]], self.source_lmk)
+        eye_target = self._blink_ratio(time.time(), speaking)
+        if eye_target is None and self.widen_t is not None:
+            p = (now_t - self.widen_t) / 0.45
+            if p >= 1.0:
+                self.widen_t = None
+            else:  # subtle widening on phrase emphasis
+                eye_target = self.c_s_eye * (1.0 + 0.16 * np.sin(np.pi * p))
+        if eye_target is not None:
+            comb_eye = self.pipe.calc_combined_eye_ratio([[eye_target]], self.source_lmk)
             eye_delta = self.pipe.retarget_eye(self.x_s, comb_eye)
             x_d = x_d + eye_delta.reshape(-1, self.x_s.shape[1], 3)
 
@@ -679,7 +715,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=SOURCE_IMAGE)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--voice", default=None, help="e.g. Aoede, Kore, Puck, Leda")
+    ap.add_argument("--voice", default="Leda", help="e.g. Leda, Aoede, Kore (femeninas); Puck (masculina)")
     ap.add_argument("--mic-device", default=None, help="sounddevice input index/name")
     ap.add_argument("--vision", action="store_true",
                     help="stream the webcam to Gemini so Eva can see")
