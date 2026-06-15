@@ -265,18 +265,42 @@ class PhonemeScheduler:
         return out
 
 
+class UserVoiceMeter:
+    """Tracks whether the human is currently speaking (with a short hangover
+    so brief pauses between words don't flicker the state)."""
+
+    def __init__(self, threshold=0.25, hangover=0.45):
+        self._lock = threading.Lock()
+        self._last_active = 0.0
+        self.threshold = threshold
+        self.hangover = hangover
+
+    def update(self, rms_norm):
+        if rms_norm > self.threshold:
+            with self._lock:
+                self._last_active = time.time()
+
+    def speaking(self) -> bool:
+        with self._lock:
+            return (time.time() - self._last_active) < self.hangover
+
+
 class MicStream:
     """Captures 16 kHz PCM16 mono and hands chunks to the asyncio sender."""
 
-    def __init__(self, loop, queue, gate=None, device=None):
+    def __init__(self, loop, queue, gate=None, device=None, meter=None):
         import sounddevice as sd
         self.loop = loop
         self.queue = queue
         self.gate = gate  # callable -> True when mic should be muted
+        self.meter = meter
         self.stream = sd.InputStream(samplerate=SEND_RATE, channels=1, dtype="int16",
                                      blocksize=1600, device=device, callback=self._callback)
 
     def _callback(self, indata, frames, time_info, status):
+        if self.meter is not None:
+            rms = float(np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2)))
+            self.meter.update(min(1.0, rms / 0.08))
         if self.gate is not None and self.gate():
             return
         data = bytes(indata.tobytes())
@@ -309,6 +333,7 @@ class GeminiVoice(threading.Thread):
         self.vision_fps = vision_fps
         self.connected = threading.Event()
         self.fatal = None
+        self.user_meter = UserVoiceMeter()
 
     def _client(self):
         from google import genai
@@ -369,7 +394,8 @@ class GeminiVoice(threading.Thread):
         # without echo cancellation the speakers feed back into the mic; by
         # default mute the mic while Eva talks (no barge-in on open speakers)
         gate = None if self.allow_barge_in else self.speaker.speaking
-        mic = MicStream(loop, mic_q, gate=gate, device=self.mic_device)
+        mic = MicStream(loop, mic_q, gate=gate, device=self.mic_device,
+                        meter=self.user_meter)
         mic.start()
         print("[gemini] mic live - habla con Eva")
 
@@ -540,6 +566,14 @@ class EvaRenderer:
         self.nod_t = None
         self.widen_t = None
         self.last_emph = 0.0
+        # listening / thinking / breathing
+        self.listen_nod_t = None
+        self.next_listen_nod = 0.0
+        self.think_s = 0.0
+        self.think_dir = 1.0
+        self.think_until = 0.0
+        self.was_listening = False
+        self.double_blinked = False
         warm = self.frame(0.0)  # build engines' first-run kernels before going live
         print(f"[init] avatar ready ({warm.shape[1]}x{warm.shape[0]})")
 
@@ -571,26 +605,36 @@ class EvaRenderer:
         p = (tnow - self.blink_t) / BLINK_DUR
         if p >= 1.0:
             self.blink_t = None
-            gap = random.uniform(3.0, 6.0) if speaking else random.uniform(2.0, 4.2)
-            self.next_blink = tnow + gap
+            if not self.double_blinked and random.random() < 0.20:
+                self.double_blinked = True   # humans double-blink ~20% of the time
+                self.next_blink = tnow + 0.25
+            else:
+                self.double_blinked = False
+                gap = random.uniform(3.0, 6.0) if speaking else random.uniform(2.0, 4.2)
+                self.next_blink = tnow + gap
             return None
         return self.c_s_eye - (self.c_s_eye - 0.03) * float(np.sin(np.pi * p))
 
-    def frame(self, lip_level, speaking=False, mouth_delta=None):
+    def frame(self, lip_level, speaking=False, mouth_delta=None, listening=False):
         """Render one RGB frame. mouth_delta (exp delta) wins over lip_level."""
         from src.utils.utils import transform_keypoint
         from src.utils.crop import paste_back_pytorch
         s = self.x_s_info
-        tnow = time.time() - self.t0
+        now_t = time.time()
+        tnow = now_t - self.t0
+        dt = min(0.2, now_t - self.last_t)
+        self.last_t = now_t
 
         # speech energy follows the lip level (fast up, slow down)
         target = lip_level if speaking else 0.0
         self.energy += (target - self.energy) * (0.5 if target > self.energy else 0.06)
         e = min(1.0, self.energy)
 
-        # while she talks the head gets livelier; an extra quick component
-        # tied to energy reads as natural speaking emphasis
+        # while she talks the head gets livelier; while she LISTENS it goes
+        # still and attentive (people quiet their bodies when paying attention)
         amp = 1.0 + 0.5 * e
+        if listening and not speaking:
+            amp = 0.45
         dyaw = self.sway * amp * (2.0 * np.sin(2 * np.pi * tnow / 8.7) + 0.7 * np.sin(2 * np.pi * tnow / 3.1))
         dpitch = self.sway * amp * 1.1 * np.sin(2 * np.pi * tnow / 6.3)
         droll = self.sway * 0.6 * np.sin(2 * np.pi * tnow / 11.2)
@@ -598,7 +642,6 @@ class EvaRenderer:
         dpitch += self.sway * 0.4 * e * np.sin(2 * np.pi * tnow / 1.4)
 
         # phrase emphasis: strong syllable after a gap -> micro-nod or eye widen
-        now_t = time.time()
         if speaking and lip_level > 0.45 and now_t - self.last_emph > 1.4:
             self.last_emph = now_t
             if random.random() < 0.65:
@@ -612,10 +655,33 @@ class EvaRenderer:
             else:
                 dpitch += self.sway * 0.9 * np.sin(np.pi * p)  # down-and-back nod
 
+        # active listening: gentle slow nods while the user talks
+        if listening and not speaking:
+            if self.listen_nod_t is None and now_t >= self.next_listen_nod:
+                self.listen_nod_t = now_t
+        if self.listen_nod_t is not None:
+            p = (now_t - self.listen_nod_t) / 0.65
+            if p >= 1.0:
+                self.listen_nod_t = None
+                self.next_listen_nod = now_t + random.uniform(2.2, 4.5)
+            else:
+                dpitch += self.sway * 0.7 * np.sin(np.pi * p)
+
+        # thinking gesture: user just stopped talking, answer not started yet
+        if self.was_listening and not listening and not speaking:
+            self.think_until = now_t + 2.8
+            self.think_dir = random.choice((-1.0, 1.0))
+        self.was_listening = listening
+        think_target = 1.0 if (not speaking and now_t < self.think_until) else 0.0
+        self.think_s += (think_target - self.think_s) * (1.0 - np.exp(-dt / 0.30))
+        if self.think_s > 0.01:  # brief glance aside-and-up while formulating
+            dyaw += self.think_dir * 2.2 * self.think_s
+            dpitch -= 0.6 * self.think_s
+
+        # breathing: ~15 breaths/min, barely perceptible scale swell
+        breath = 1.0 + 0.003 * np.sin(2 * np.pi * tnow / 4.0)
+
         # smile eases in when she's quiet, eases mostly out while she talks
-        now = time.time()
-        dt = min(0.2, now - self.last_t)
-        self.last_t = now
         smile_target = 0.15 if speaking else 1.0
         self.smile_s += (smile_target - self.smile_s) * (1.0 - np.exp(-dt / 0.6))
 
@@ -629,7 +695,7 @@ class EvaRenderer:
             exp = exp + mouth_delta
 
         x_d = transform_keypoint(s["pitch"] + dpitch, s["yaw"] + dyaw, s["roll"] + droll,
-                                 s["t"], exp, s["scale"], s["kp"])
+                                 s["t"], exp, s["scale"] * breath, s["kp"])
 
         if mouth_delta is None:
             # fallback: lip-openness retargeting (less natural: no jaw motion)
@@ -797,6 +863,7 @@ def main():
         while True:
             t_start = time.time()
             mouth_delta = None
+            listening = False
             if args.mute:  # synthetic syllables to eyeball the lip mapping
                 demo_level = max(0.0, demo_level * 0.7 + (random.random() < 0.35) * random.uniform(0.4, 1.0))
                 level = min(1.0, demo_level)
@@ -804,9 +871,11 @@ def main():
             else:
                 level = speaker.level()
                 speaking = speaker.speaking()
+                listening = voice.user_meter.speaking() and not speaking
                 if scheduler is not None:
                     mouth_delta = renderer.weights_delta(scheduler.weights(speaker.now_ms()))
-            face = renderer.frame(level, speaking, mouth_delta=mouth_delta)
+            face = renderer.frame(level, speaking, mouth_delta=mouth_delta,
+                                  listening=listening)
             sink.submit(face)
             if sink.quit_requested:
                 break

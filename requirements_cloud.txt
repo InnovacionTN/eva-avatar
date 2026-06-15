@@ -1,0 +1,33 @@
+# Eva cloud (GCP L4, Ubuntu 22.04) — Python 3.10 venv
+# Installed ON TOP OF the FasterLivePortrait base requirements
+# (third_party/FasterLivePortrait/requirements.txt) inside the SAME venv.
+#
+# Pin notes:
+# - torch/onnxruntime/tensorrt are NOT pinned here: install the CUDA-matched
+#   build for the L4 driver on the box (see eva_cloud.md §4). Pinning them here
+#   would fight the system CUDA.
+# - Versions below mirror what is proven working on the local Windows box
+#   (google-genai 2.8.0 etc.) — bump only with a reason.
+
+# --- Gemini Live + config (unchanged from local) ---
+google-genai==2.8.0
+python-dotenv==1.0.1
+
+# --- core CV / math (FLP also pulls these; pinned for reproducibility) ---
+numpy==1.26.4
+opencv-python-headless==4.10.0.84   # headless: VM has no display/GTK
+omegaconf==2.3.0
+
+# --- WebRTC streaming layer (REPLACES sounddevice + pyvirtualcam + cv2 webcam) ---
+aiortc==1.9.0          # Python WebRTC: media tracks, ICE, SDP, Opus/VP8
+aiohttp==3.10.5        # tiny signaling + static page server
+av==12.3.0             # PyAV: VideoFrame / AudioFrame, resampling (pulled by aiortc, pinned)
+
+# --- audio resampling (24k<->48k, 48k<->16k) ---
+# av (libswresample) handles resample; scipy is a fallback if you prefer numpy-side.
+scipy==1.13.1
+
+# NOTE: REMOVE from the local app — do NOT install on the VM:
+#   sounddevice      (no audio devices on a headless VM)
+#   pyvirtualcam     (no OBS / v4l2 sink needed; video leaves via WebRTC)
+# cv2.VideoCapture(webcam) is also unused: the browser supplies the camera.
