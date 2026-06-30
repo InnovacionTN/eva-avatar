@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Eva — Tiendas Neto</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+               font-family: system-ui, Segoe UI, Roboto, sans-serif; overflow: hidden; }
+  #eva { position: fixed; inset: 0; width: 100%; height: 100%;
+         object-fit: contain; background: #000; }
+  #self { position: fixed; right: 12px; bottom: 12px; width: 132px; height: 99px;
+          object-fit: cover; border-radius: 8px; border: 1px solid #333;
+          transform: scaleX(-1); opacity: .85; background: #111; z-index: 5; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px;
+         justify-content: center; padding: 12px; z-index: 6;
+         background: linear-gradient(to top, rgba(0,0,0,.6), rgba(0,0,0,0)); }
+  #bar button { background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.25);
+                border-radius: 999px; padding: 9px 15px; font-size: 14px; cursor: pointer; }
+  #bar button:hover { background: rgba(255,255,255,.22); }
+  #status { position: fixed; top: 10px; left: 0; right: 0; text-align: center;
+            font-size: 13px; color: #aaa; z-index: 6; pointer-events: none; }
+  #mic { position: fixed; left: 12px; bottom: 12px; display: none; align-items: center;
+         gap: 9px; z-index: 6; background: rgba(0,0,0,.5); padding: 8px 13px; border-radius: 999px; }
+  #micicon { font-size: 18px; filter: grayscale(1) opacity(.55); transition: filter .08s; }
+  #micicon.active { filter: none; }
+  #micbar { width: 120px; height: 8px; background: rgba(255,255,255,.16);
+            border-radius: 4px; overflow: hidden; }
+  #micfill { height: 100%; width: 0%; background: #43d977; border-radius: 4px; }
+  #mictxt { font-size: 12px; color: #bbb; min-width: 86px; }
+  #micsel { display: none; max-width: 180px; background: #111; color: #eee;
+            border: 1px solid #444; border-radius: 6px; padding: 5px 7px; font-size: 12px; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column;
+             align-items: center; justify-content: center; background: #000; z-index: 20; gap: 18px; }
+  #overlay h1 { font-weight: 600; font-size: 26px; margin: 0; }
+  #overlay p { color: #aaa; margin: 0; max-width: 340px; text-align: center; line-height: 1.5; }
+  #start { background: #ff7a00; color: #000; border: none; border-radius: 999px;
+           padding: 14px 34px; font-size: 18px; font-weight: 700; cursor: pointer; }
+</style>
+</head>
+<body>
+  <img id="eva" alt="Eva">
+  <video id="self" autoplay playsinline muted></video>
+  <div id="status">Conectando…</div>
+  <div id="mic">
+    <span id="micicon">🎤</span>
+    <div id="micbar"><div id="micfill"></div></div>
+    <span id="mictxt">micrófono…</span>
+    <select id="micsel" title="Elegir micrófono"></select>
+  </div>
+  <div id="bar">
+    <button data-g="nod">Asentir</button>
+    <button data-g="shake">Negar</button>
+    <button data-g="tilt">Ladear</button>
+    <button data-g="lean">Acercarse</button>
+    <button data-g="shrug">Encoger</button>
+  </div>
+
+  <div id="overlay">
+    <h1>Eva — Tiendas Neto</h1>
+    <p>Habla con Eva en español. Te va a escuchar y ver por tu cámara.
+       Permite el micrófono y la cámara cuando el navegador lo pida.</p>
+    <button id="start">▶  Hablar con Eva</button>
+    <p style="font-size:12px">Usa audífonos para mejor experiencia.</p>
+  </div>
+
+<script>
+// surface any JS error on screen (a separate script so it also catches
+// syntax errors in the main script below)
+window.addEventListener('error', function (ev) {
+  var s = document.getElementById('status');
+  if (s) { s.style.color = '#ff6b6b'; s.textContent = 'JS error: ' + (ev.message || '') + ' @line ' + (ev.lineno || '?'); }
+});
+window.addEventListener('unhandledrejection', function (ev) {
+  var s = document.getElementById('status');
+  if (s) { s.style.color = '#ff6b6b'; s.textContent = 'Error: ' + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason); }
+});
+</script>
+<script>
+const evaImg = document.getElementById('eva');
+const selfVid = document.getElementById('self');
+const statusEl = document.getElementById('status');
+const overlay = document.getElementById('overlay');
+const micBox = document.getElementById('mic');
+const micIcon = document.getElementById('micicon');
+const micFill = document.getElementById('micfill');
+const micTxt = document.getElementById('mictxt');
+const micSel = document.getElementById('micsel');
+function setStatus(t){ statusEl.textContent = t; }
+
+// mic level meter: driven by the same PCM we send to the server
+let micLevel = 0, micEver = 0, micLastSound = 0, micStarted = false;
+function meterLoop() {
+  micLevel *= 0.85;                                  // smooth decay between samples
+  const pct = Math.min(100, micLevel / 0.15 * 100);
+  micFill.style.width = pct.toFixed(0) + '%';
+  const live = micLevel > 0.01;
+  micIcon.classList.toggle('active', live);
+  if (live) micLastSound = performance.now();
+  if (!micEver) micTxt.textContent = 'micrófono…';
+  else if (performance.now() - micLastSound > 4000) micTxt.textContent = '¿me oyes? habla';
+  else micTxt.textContent = 'te escucho ✓';
+  requestAnimationFrame(meterLoop);
+}
+
+const TAG_AUDIO = 0, TAG_VIDEO = 1, TAG_FLUSH = 2;
+let ws, actx, nextTime = 0;
+const activeSrc = new Set();
+
+// --- mic capture worklet: downsample the browser's native rate to 16 kHz PCM16 ---
+const workletCode = `
+class MicProc extends AudioWorkletProcessor {
+  constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    let i = this.pos; const out = [];
+    for (; i < ch.length; i += this.ratio) {
+      let v = ch[i | 0] * 32768;
+      v = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+      out.push(v | 0);
+    }
+    this.pos = i - ch.length;
+    if (out.length) { const b = new Int16Array(out); this.port.postMessage(b.buffer, [b.buffer]); }
+    return true;
+  }
+}
+registerProcessor('mic-proc', MicProc);
+`;
+const workletURL = URL.createObjectURL(new Blob([workletCode], {type: 'application/javascript'}));
+
+function playPCM(ab) {
+  const i16 = new Int16Array(ab);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  const buf = actx.createBuffer(1, f32.length, 24000);
+  buf.copyToChannel(f32, 0);
+  const src = actx.createBufferSource();
+  src.buffer = buf; src.connect(actx.destination);
+  const now = actx.currentTime;
+  if (nextTime < now + 0.02) nextTime = now + 0.06;   // small jitter buffer
+  src.start(nextTime);
+  activeSrc.add(src);
+  src.onended = () => activeSrc.delete(src);
+  nextTime += buf.duration;
+}
+function flushAudio() {
+  for (const s of activeSrc) { try { s.stop(); } catch (e) {} }
+  activeSrc.clear(); nextTime = 0;
+}
+
+function connectWS() {
+  const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws';
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setStatus('Conectado — habla con Eva 🎙️');
+  ws.onclose = () => setStatus('Desconectado');
+  ws.onerror = () => setStatus('Error de conexión');
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') { try { setStatus(JSON.parse(e.data).msg); } catch (x) {} return; }
+    const tag = new Uint8Array(e.data, 0, 1)[0];
+    const payload = e.data.slice(1);
+    if (tag === TAG_AUDIO) playPCM(payload);
+    else if (tag === TAG_VIDEO) {
+      const url2 = URL.createObjectURL(new Blob([payload], {type: 'image/jpeg'}));
+      const prev = evaImg.dataset.url;
+      evaImg.src = url2; evaImg.dataset.url = url2;
+      if (prev) URL.revokeObjectURL(prev);
+    } else if (tag === TAG_FLUSH) flushAudio();
+  };
+}
+
+// send one PCM16 frame to the server + drive the level meter (shared by both
+// the AudioWorklet path and the ScriptProcessor fallback)
+function sendPCM16(i16) {
+  if (ws && ws.readyState === 1) {
+    const bytes = new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength);
+    const msg = new Uint8Array(bytes.length + 1); msg[0] = TAG_AUDIO; msg.set(bytes, 1);
+    ws.send(msg.buffer);
+  }
+  let sum = 0; for (let i = 0; i < i16.length; i++) { const v = i16[i] / 32768; sum += v * v; }
+  const rms = i16.length ? Math.sqrt(sum / i16.length) : 0;
+  if (rms > micLevel) micLevel = rms;
+  if (rms > 0.01) micEver = 1;
+}
+function downsampleI16(f32, inRate) {
+  const ratio = inRate / 16000;
+  const len = Math.max(1, Math.floor(f32.length / ratio));
+  const out = new Int16Array(len);
+  let pos = 0;
+  for (let i = 0; i < len; i++) {
+    let v = f32[pos | 0] * 32768;
+    v = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+    out[i] = v | 0; pos += ratio;
+  }
+  return out;
+}
+// the mic capture graph; the source can be swapped when a different mic is picked
+let micStream = null, captureSrc = null, captureNode = null, captureSink = null;
+
+function spFallback() {
+  if (micStarted || !captureSrc) return;
+  try {
+    const sp = actx.createScriptProcessor(4096, 1, 1);
+    sp.onaudioprocess = (e) => {
+      micStarted = true;
+      sendPCM16(downsampleI16(e.inputBuffer.getChannelData(0), actx.sampleRate));
+    };
+    captureSrc.connect(sp); sp.connect(captureSink); captureNode = sp;
+  } catch (err) { setStatus('mic no disponible: ' + err.message); }
+}
+
+function rebuildCapture(stream) {
+  try { if (captureSrc) captureSrc.disconnect(); } catch (e) {}
+  try { if (captureNode) captureNode.disconnect(); } catch (e) {}
+  captureNode = null; micStarted = false;
+  if (!captureSink) { captureSink = actx.createGain(); captureSink.gain.value = 0; captureSink.connect(actx.destination); }
+  captureSrc = actx.createMediaStreamSource(stream);
+  if (actx.audioWorklet) {
+    actx.audioWorklet.addModule(workletURL).then(() => {
+      if (micStarted) return;
+      const mic = new AudioWorkletNode(actx, 'mic-proc');
+      mic.port.onmessage = (e) => { micStarted = true; sendPCM16(new Int16Array(e.data)); };
+      captureSrc.connect(mic); mic.connect(captureSink); captureNode = mic;
+    }).catch(spFallback);
+    setTimeout(() => { if (!micStarted) spFallback(); }, 1500);  // kiosk/WebView fallback
+  } else { spFallback(); }
+}
+
+async function applyMic(deviceId) {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: deviceId ? { exact: deviceId } : undefined,
+               echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    if (micStream) micStream.getAudioTracks().forEach(t => t.stop());   // stop only the old mic
+    micStream = s;
+    rebuildCapture(s);
+    refreshMicList();
+  } catch (e) { setStatus('No se pudo abrir ese micrófono: ' + e.message); }
+}
+
+async function refreshMicList() {
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const mics = devs.filter(d => d.kind === 'audioinput');
+    micSel.innerHTML = '';
+    mics.forEach((d, i) => {
+      const o = document.createElement('option');
+      o.value = d.deviceId; o.textContent = d.label || ('Micrófono ' + (i + 1));
+      micSel.appendChild(o);
+    });
+    const tr = micStream && micStream.getAudioTracks()[0];
+    const cur = tr && tr.getSettings ? tr.getSettings().deviceId : null;
+    if (cur) micSel.value = cur;
+    micSel.style.display = mics.length ? 'inline-block' : 'none';
+  } catch (e) {}
+}
+
+async function start() {
+  overlay.style.display = 'none';
+  // create + resume the AudioContext *inside* the tap, before any await —
+  // otherwise Android drops the user-gesture and the context stays suspended
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    actx.resume();
+  } catch (e) { setStatus('Audio no soportado: ' + e.message); }
+
+  setStatus('Pidiendo cámara y micrófono…');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: { facingMode: 'user', width: { ideal: 640 } }
+    });
+  } catch (err) {
+    try {   // some Android browsers reject detailed constraints — retry simplest
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    } catch (err2) {
+      setStatus('No se pudo abrir cámara/micrófono: ' + err2.message);
+      overlay.style.display = 'flex';
+      return;
+    }
+  }
+  selfVid.srcObject = stream;
+
+  if (!stream.getAudioTracks().length) setStatus('⚠️ Sin micrófono: revisa el permiso del navegador');
+
+  micBox.style.display = 'flex';
+  meterLoop();
+  if (actx) {
+    if (actx.state === 'suspended') { try { await actx.resume(); } catch (e) {} }
+    micStream = stream;
+    rebuildCapture(stream);
+    refreshMicList();
+  }
+  connectWS();
+
+  // camera frames to Gemini (~1 fps)
+  const cap = document.createElement('canvas');
+  setInterval(() => {
+    if (!ws || ws.readyState !== 1 || selfVid.videoWidth === 0) return;
+    const w = 640, h = Math.round(selfVid.videoHeight * 640 / selfVid.videoWidth);
+    cap.width = w; cap.height = h;
+    cap.getContext('2d').drawImage(selfVid, 0, 0, w, h);
+    cap.toBlob(async (blob) => {
+      if (!blob || ws.readyState !== 1) return;
+      const ab = await blob.arrayBuffer();
+      const pcm = new Uint8Array(ab);
+      const msg = new Uint8Array(pcm.length + 1); msg[0] = TAG_VIDEO; msg.set(pcm, 1);
+      ws.send(msg.buffer);
+    }, 'image/jpeg', 0.6);
+  }, 1000);
+}
+
+document.getElementById('start').addEventListener('click', start);
+micSel.addEventListener('change', () => applyMic(micSel.value));
+document.querySelectorAll('#bar button').forEach(b => b.addEventListener('click', () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ gesture: b.dataset.g }));
+}));
+</script>
+</body>
+</html>
