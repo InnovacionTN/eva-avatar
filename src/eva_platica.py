@@ -288,21 +288,35 @@ class UserVoiceMeter:
 class MicStream:
     """Captures 16 kHz PCM16 mono and hands chunks to the asyncio sender."""
 
-    def __init__(self, loop, queue, gate=None, device=None, meter=None):
+    def __init__(self, loop, queue, gate=None, device=None, meter=None, debug=False):
         import sounddevice as sd
         self.loop = loop
         self.queue = queue
         self.gate = gate  # callable -> True when mic should be muted
         self.meter = meter
+        self.debug = debug
+        self._dbg_peak = 0.0
+        self._dbg_t = time.time()
+        self._dbg_sent = 0
         self.stream = sd.InputStream(samplerate=SEND_RATE, channels=1, dtype="int16",
                                      blocksize=1600, device=device, callback=self._callback)
 
     def _callback(self, indata, frames, time_info, status):
+        rms = float(np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2)))
         if self.meter is not None:
-            rms = float(np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2)))
             self.meter.update(min(1.0, rms / 0.08))
-        if self.gate is not None and self.gate():
+        muted = self.gate is not None and self.gate()
+        if self.debug:
+            self._dbg_peak = max(self._dbg_peak, rms)
+            now = time.time()
+            if now - self._dbg_t >= 1.0:
+                bar = "#" * int(min(1.0, self._dbg_peak / 0.05) * 20)
+                print(f"[mic] level {self._dbg_peak:.3f} |{bar:<20}| "
+                      f"{'MUTED(Eva talking)' if muted else 'sent ' + str(self._dbg_sent) + ' chunks'}")
+                self._dbg_peak, self._dbg_t, self._dbg_sent = 0.0, now, 0
+        if muted:
             return
+        self._dbg_sent += 1
         data = bytes(indata.tobytes())
         self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
 
@@ -320,7 +334,7 @@ class MicStream:
 class GeminiVoice(threading.Thread):
     def __init__(self, speaker, model=None, voice=None, allow_barge_in=False,
                  mic_device=None, scheduler=None, vision=False, vision_camera=0,
-                 vision_fps=1.0):
+                 vision_fps=1.0, debug_audio=False):
         super().__init__(daemon=True)
         self.speaker = speaker
         self.model = model
@@ -328,6 +342,7 @@ class GeminiVoice(threading.Thread):
         self.allow_barge_in = allow_barge_in
         self.mic_device = mic_device
         self.scheduler = scheduler
+        self.debug_audio = debug_audio
         self.vision = vision
         self.vision_camera = vision_camera
         self.vision_fps = vision_fps
@@ -395,7 +410,7 @@ class GeminiVoice(threading.Thread):
         # default mute the mic while Eva talks (no barge-in on open speakers)
         gate = None if self.allow_barge_in else self.speaker.speaking
         mic = MicStream(loop, mic_q, gate=gate, device=self.mic_device,
-                        meter=self.user_meter)
+                        meter=self.user_meter, debug=self.debug_audio)
         mic.start()
         print("[gemini] mic live - habla con Eva")
 
@@ -406,6 +421,7 @@ class GeminiVoice(threading.Thread):
                     audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={SEND_RATE}"))
 
         async def receiver():
+            got_audio = 0
             while True:
                 async for message in session.receive():
                     sc = getattr(message, "server_content", None)
@@ -414,7 +430,13 @@ class GeminiVoice(threading.Thread):
                         if self.scheduler is not None:
                             self.scheduler.clear(self.speaker.now_ms())
                     if message.data:
+                        if self.debug_audio:
+                            got_audio += len(message.data)
+                            if got_audio and got_audio - len(message.data) == 0:
+                                print("[gemini] <- receiving Eva audio (she heard you)")
                         self.speaker.feed(message.data)
+                    if self.debug_audio and sc is not None and getattr(sc, "turn_complete", False):
+                        print(f"[gemini] turn complete ({got_audio} bytes this session)")
                     if sc is not None and self.scheduler is not None:
                         tr = getattr(sc, "output_transcription", None)
                         if tr is not None and getattr(tr, "text", None):
@@ -461,12 +483,14 @@ class OutputSink(threading.Thread):
     """Compose + virtual-cam send + preview on their own thread so the GPU
     render loop never waits on them."""
 
-    def __init__(self, cam, preview, canvas_base, side, x_off, y_off):
+    def __init__(self, cam, preview, canvas_base, dst_w, dst_h, x_off, y_off, key_cb=None):
         super().__init__(daemon=True)
         self.cam = cam
         self.preview = preview
         self.canvas_base = canvas_base
-        self.side, self.x_off, self.y_off = side, x_off, y_off
+        self.dst_w, self.dst_h = dst_w, dst_h
+        self.x_off, self.y_off = x_off, y_off
+        self.key_cb = key_cb
         self.cond = threading.Condition()
         self.face = None
         self.running = True
@@ -486,14 +510,17 @@ class OutputSink(threading.Thread):
             if face is None:
                 continue
             canvas = self.canvas_base.copy()
-            canvas[self.y_off:self.y_off + self.side, self.x_off:self.x_off + self.side] = \
-                cv2.resize(face, (self.side, self.side))
+            canvas[self.y_off:self.y_off + self.dst_h, self.x_off:self.x_off + self.dst_w] = \
+                cv2.resize(face, (self.dst_w, self.dst_h))
             if self.cam is not None:
                 self.cam.send(canvas)
             if self.preview:
                 cv2.imshow("Eva platica", cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     self.quit_requested = True
+                elif key != 255 and self.key_cb is not None:
+                    self.key_cb(key)
         if self.preview:
             cv2.destroyAllWindows()
 
@@ -503,8 +530,18 @@ class OutputSink(threading.Thread):
             self.cond.notify()
 
 
+# Triggerable gestures. Head-pose gestures (nod/shake/tilt/lean) ride the same
+# 3D head engine as the idle motion; "shrug" also lifts the shoulders via the
+# body warp. Durations in seconds. Keys are for the preview window.
+GESTURES = {"nod": 1.0, "shake": 1.0, "tilt": 1.6, "lean": 1.6, "shrug": 1.0}
+GESTURE_KEYS = {ord("n"): "nod", ord("m"): "shake", ord("t"): "tilt",
+                ord("l"): "lean", ord("g"): "shrug"}
+
+
 class EvaRenderer:
-    def __init__(self, source, pasteback=True, lip_gain=0.8, sway=1.0, smile_gain=0.0):
+    def __init__(self, source, pasteback=True, lip_gain=0.8, sway=1.0, smile_gain=0.0,
+                 body_motion=False, body_sway=1.0, body_breath=1.0,
+                 shoulder_y=0.20, hip_y=0.52):
         from omegaconf import OmegaConf
         from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline
 
@@ -574,6 +611,44 @@ class EvaRenderer:
         self.think_until = 0.0
         self.was_listening = False
         self.double_blinked = False
+
+        # ---- procedural body motion (full-body source) ----------------------
+        # LivePortrait only animates the face crop; the torso/arms/legs stay
+        # frozen. We add a subtle 2D "living photo" warp on the pasted-back
+        # frame: the upper body sways (feet planted, pivot at the hips) and the
+        # chest breathes. The source's black background makes the warp seamless
+        # (revealed/covered pixels are just black -> no inpainting needed).
+        self.body_motion = body_motion and self.pasteback
+        self.body_sway = body_sway
+        self.body_breath = body_breath
+        self.F = self.torch.nn.functional
+        if self.body_motion:
+            dev = self.pipe.device
+            H, W = self.src_rgb.shape[:2]
+            self.bm_W, self.bm_H = W, H
+            ys = self.torch.linspace(-1.0, 1.0, H, device=dev)
+            xs = self.torch.linspace(-1.0, 1.0, W, device=dev)
+            gy, gx = self.torch.meshgrid(ys, xs, indexing="ij")
+            self.bm_base = self.torch.stack((gx, gy), dim=-1).unsqueeze(0)  # 1,H,W,2
+            row = self.torch.linspace(0.0, 1.0, H, device=dev)             # 0 top .. 1 bottom
+            # sway weight: 1 from the head down to the shoulders, then ramps to
+            # 0 at the hip line; 0 below (legs/feet stay planted)
+            w = self.torch.clamp((hip_y - row) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0)
+            w = self.torch.where(row < shoulder_y, self.torch.ones_like(w), w)
+            self.bm_sway_w = w.view(1, H, 1)
+            # breathing weight: a soft bump centered on the chest
+            chest = 0.5 * (shoulder_y + hip_y)
+            self.bm_breath_w = self.torch.exp(-0.5 * ((row - chest) / 0.12) ** 2).view(1, H, 1)
+            # shrug weight: a band peaking at the shoulders (low at the head and
+            # below the chest) so a shrug lifts the shoulders, not the whole body
+            self.bm_shrug_w = self.torch.exp(-0.5 * ((row - (shoulder_y + 0.03)) / 0.05) ** 2).view(1, H, 1)
+            print(f"[init] body motion on (shoulder_y={shoulder_y}, hip_y={hip_y})")
+
+        # ---- triggerable gestures ----
+        self._g_lock = threading.Lock()
+        self._gesture = None
+        self._gesture_t0 = 0.0
+
         warm = self.frame(0.0)  # build engines' first-run kernels before going live
         print(f"[init] avatar ready ({warm.shape[1]}x{warm.shape[0]})")
 
@@ -594,6 +669,54 @@ class EvaRenderer:
             if w > 0.001 and name in self.templates:
                 delta = delta + self.templates[name] * (w * self.lip_gain)
         return delta
+
+    def trigger_gesture(self, name):
+        """Start a gesture; replaces any in-flight one. Thread-safe (callable
+        from the preview key handler or the render loop)."""
+        if name in GESTURES:
+            with self._g_lock:
+                self._gesture = name
+                self._gesture_t0 = time.time()
+
+    def trigger_gesture_by_key(self, key):
+        name = GESTURE_KEYS.get(key)
+        if name:
+            self.trigger_gesture(name)
+
+    def _gesture_contrib(self, now_t):
+        """Per-frame additive contribution of the active gesture, or None.
+
+        Returns head-pose deltas (degrees), a scale bump (lean toward camera),
+        and a 0..1 shrug amount for the body warp.
+        """
+        with self._g_lock:
+            g, gt0 = self._gesture, self._gesture_t0
+        if g is None:
+            return None
+        p = (now_t - gt0) / GESTURES[g]
+        if p >= 1.0:
+            with self._g_lock:
+                if self._gesture == g and self._gesture_t0 == gt0:
+                    self._gesture = None
+            return None
+        env = float(np.sin(np.pi * p))            # smooth ease in/out (0..1..0)
+        tau = 2 * np.pi
+        c = {"dpitch": 0.0, "dyaw": 0.0, "droll": 0.0, "dscale": 0.0, "shrug": 0.0}
+        if g == "nod":                            # "yes": two dips, chin down first
+            c["dpitch"] = 8.0 * env * float(np.sin(tau * 2 * p))
+        elif g == "shake":                        # "no": a few yaw oscillations
+            c["dyaw"] = 10.0 * env * float(np.sin(tau * 2.5 * p))
+        elif g == "tilt":                         # friendly head tilt + slight turn
+            c["droll"] = 8.0 * env
+            c["dyaw"] = 2.5 * env
+        elif g == "lean":                         # lean toward camera (interest)
+            c["dscale"] = 0.045 * env
+            c["dpitch"] = -1.5 * env
+        elif g == "shrug":                        # shoulders up + tilt to sell it
+            c["shrug"] = env
+            c["droll"] = 5.0 * env
+            c["dpitch"] = 2.0 * env
+        return c
 
     def _blink_ratio(self, tnow, speaking):
         # long enough that the closed eyes land on rendered frames at ~10 fps
@@ -641,13 +764,17 @@ class EvaRenderer:
         dyaw += self.sway * 0.6 * e * np.sin(2 * np.pi * tnow / 1.9)
         dpitch += self.sway * 0.4 * e * np.sin(2 * np.pi * tnow / 1.4)
 
-        # phrase emphasis: strong syllable after a gap -> micro-nod or eye widen
+        # phrase emphasis: strong syllable after a gap -> micro-nod, eye widen,
+        # or (occasionally) a fuller head tilt so she gestures while she talks
         if speaking and lip_level > 0.45 and now_t - self.last_emph > 1.4:
             self.last_emph = now_t
-            if random.random() < 0.65:
+            r = random.random()
+            if r < 0.5:
                 self.nod_t = now_t
-            else:
+            elif r < 0.65:
                 self.widen_t = now_t
+            elif r < 0.78 and self._gesture is None:
+                self.trigger_gesture("tilt")
         if self.nod_t is not None:
             p = (now_t - self.nod_t) / 0.38
             if p >= 1.0:
@@ -678,6 +805,16 @@ class EvaRenderer:
             dyaw += self.think_dir * 2.2 * self.think_s
             dpitch -= 0.6 * self.think_s
 
+        # active gesture (keyboard- or speech-triggered): adds to head pose,
+        # scale (lean), and a shrug amount for the body warp
+        g_scale, g_shrug = 0.0, 0.0
+        gc = self._gesture_contrib(now_t)
+        if gc is not None:
+            dpitch += gc["dpitch"]
+            dyaw += gc["dyaw"]
+            droll += gc["droll"]
+            g_scale, g_shrug = gc["dscale"], gc["shrug"]
+
         # breathing: ~15 breaths/min, barely perceptible scale swell
         breath = 1.0 + 0.003 * np.sin(2 * np.pi * tnow / 4.0)
 
@@ -695,7 +832,7 @@ class EvaRenderer:
             exp = exp + mouth_delta
 
         x_d = transform_keypoint(s["pitch"] + dpitch, s["yaw"] + dyaw, s["roll"] + droll,
-                                 s["t"], exp, s["scale"] * breath, s["kp"])
+                                 s["t"], exp, s["scale"] * (breath + g_scale), s["kp"])
 
         if mouth_delta is None:
             # fallback: lip-openness retargeting (less natural: no jaw motion)
@@ -720,7 +857,38 @@ class EvaRenderer:
         out = self.pipe.model_dict["warping_spade"].predict(self.f_s, self.x_s, x_d)
         if self.pasteback:
             out = paste_back_pytorch(out, self.M, self.base_tensor.clone(), self.mask_ori)
+        if self.body_motion:
+            out = self._body_warp(out, tnow, e, speaking, listening, shrug=g_shrug)
         return out.to(dtype=self.torch.uint8).cpu().numpy()
+
+    def _body_warp(self, out, tnow, e, speaking, listening, shrug=0.0):
+        """Sway the upper body + breathe the chest. `out` is an HxWx3 GPU tensor.
+
+        Sway is phase-locked to the head yaw (same 8.7 s period, slight lag) so
+        head and torso move as one body; amplitude grows a little while she
+        speaks and quiets while she listens. Breathing is a slow chest swell.
+        """
+        np_sin = np.sin
+        amp = self.body_sway * (1.0 + 0.5 * e)
+        if listening and not speaking:
+            amp *= 0.5
+        # pixels of lateral shift at the shoulders (scaled to normalized coords)
+        sway_px = amp * (6.0 * np_sin(2 * np.pi * (tnow - 0.25) / 8.7)
+                         + 2.0 * np_sin(2 * np.pi * tnow / 3.1))
+        dx = float(sway_px) * 2.0 / self.bm_W
+        # chest swell: 0..1 raised cosine, ~15 breaths/min; lifts the chest up
+        breath = 0.5 - 0.5 * np.cos(2 * np.pi * tnow / 4.0)
+        dy = -float(self.body_breath * 3.0 * breath) * 2.0 / self.bm_H
+        # shrug: briefly lift the shoulder band upward
+        shrug_lift = -float(shrug * 7.0) * 2.0 / self.bm_H
+        # grid_sample reads input at grid coords: to move content by +d, sample at -d
+        gx = self.bm_base[..., 0] - dx * self.bm_sway_w
+        gy = self.bm_base[..., 1] - dy * self.bm_breath_w - shrug_lift * self.bm_shrug_w
+        grid = self.torch.stack((gx, gy), dim=-1)
+        img = out.permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
+        warped = self.F.grid_sample(img, grid, mode="bilinear",
+                                    padding_mode="zeros", align_corners=True)
+        return warped.squeeze(0).permute(1, 2, 0)
 
 
 # --------------------------------------------------------------------------
@@ -799,12 +967,24 @@ def main():
     ap.add_argument("--lip-lead", type=float, default=120.0,
                     help="ms the mouth runs ahead of the audio (raise if lips feel late)")
     ap.add_argument("--smile-gain", type=float, default=0.0)
-    ap.add_argument("--sway", type=float, default=1.0, help="idle motion amount (0 = statue)")
+    ap.add_argument("--sway", type=float, default=1.0, help="idle head motion amount (0 = statue)")
+    ap.add_argument("--body-motion", action="store_true",
+                    help="subtly animate the whole body (use with a full-body source)")
+    ap.add_argument("--body-sway", type=float, default=1.6,
+                    help="upper-body sway amount (0 = torso frozen)")
+    ap.add_argument("--body-breath", type=float, default=1.0,
+                    help="chest breathing amount (0 = no breathing)")
+    ap.add_argument("--shoulder-y", type=float, default=0.20,
+                    help="shoulder line as a fraction of image height (sway pivot top)")
+    ap.add_argument("--hip-y", type=float, default=0.52,
+                    help="hip line as a fraction of image height (sway pivot, planted below)")
     ap.add_argument("--no-pasteback", action="store_true")
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--no-virtual-cam", action="store_true")
     ap.add_argument("--check", action="store_true", help="connectivity test only, no avatar")
     ap.add_argument("--mute", action="store_true", help="render avatar without Gemini (lip test)")
+    ap.add_argument("--debug-audio", action="store_true",
+                    help="log mic level + whether Gemini is replying (diagnose 'she doesn't answer')")
     ap.add_argument("--max-frames", type=int, default=0, help="exit after N frames (testing)")
     args = ap.parse_args()
 
@@ -812,9 +992,17 @@ def main():
         run_check(args)
         return
 
+    # we chdir'd into the FLP package at import; resolve a relative source path
+    # against the project root so `--source assets/...` works as the user expects
+    if not os.path.isabs(args.source):
+        args.source = os.path.join(PROJECT_ROOT, args.source)
+
+    body_motion = args.body_motion or "body" in os.path.basename(args.source).lower()
     renderer = EvaRenderer(args.source, pasteback=not args.no_pasteback,
                            lip_gain=args.lip_gain, sway=args.sway,
-                           smile_gain=args.smile_gain)
+                           smile_gain=args.smile_gain, body_motion=body_motion,
+                           body_sway=args.body_sway, body_breath=args.body_breath,
+                           shoulder_y=args.shoulder_y, hip_y=args.hip_y)
 
     speaker = None
     scheduler = None
@@ -829,19 +1017,22 @@ def main():
         voice = GeminiVoice(speaker, model=args.model, voice=args.voice,
                             allow_barge_in=args.allow_barge_in, mic_device=mic_dev,
                             scheduler=scheduler, vision=args.vision,
-                            vision_camera=args.vision_camera, vision_fps=args.vision_fps)
+                            vision_camera=args.vision_camera, vision_fps=args.vision_fps,
+                            debug_audio=args.debug_audio)
         voice.start()
         voice.connected.wait(timeout=60)
         if voice.fatal:
             sys.exit(f"[gemini] failed: {voice.fatal}")
         print(f"[init] mouth driver: {'fonemas' if scheduler else 'envelope'}")
 
-    # ---- output canvas ----
+    # ---- output canvas: letterbox the render into OWxOH, preserve aspect ----
+    # The full-body source sits on black, so black bars are seamless.
     OW, OH = args.out_width, args.out_height
-    side = min(OW, OH)
-    x_off, y_off = (OW - side) // 2, (OH - side) // 2
-    bg = cv2.GaussianBlur(cv2.resize(renderer.src_rgb, (OW, OH)), (0, 0), 25)
-    canvas_base = bg.copy()
+    fh, fw = renderer.src_rgb.shape[:2]
+    scale = min(OW / fw, OH / fh)
+    dst_w, dst_h = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+    x_off, y_off = (OW - dst_w) // 2, (OH - dst_h) // 2
+    canvas_base = np.zeros((OH, OW, 3), dtype=np.uint8)
 
     cam = None
     if not args.no_virtual_cam:
@@ -850,8 +1041,12 @@ def main():
                                   fmt=pyvirtualcam.PixelFormat.RGB)
         print(f"[init] virtual camera: {cam.device} {OW}x{OH}@{args.fps}")
 
-    sink = OutputSink(cam, args.preview, canvas_base, side, x_off, y_off)
+    sink = OutputSink(cam, args.preview, canvas_base, dst_w, dst_h, x_off, y_off,
+                      key_cb=renderer.trigger_gesture_by_key)
     sink.start()
+    if args.preview:
+        print("[keys] focus the preview window, then: n=nod (sí)  m=shake (no)  "
+              "t=tilt  l=lean-in  g=shrug  q=quit")
 
     frame_budget = 1.0 / args.fps
     n_done, fps_now = 0, 0.0
