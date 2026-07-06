@@ -91,6 +91,7 @@ function setStatus(t){ statusEl.textContent = t; }
 
 // mic level meter: driven by the same PCM we send to the server
 let micLevel = 0, micEver = 0, micLastSound = 0, micStarted = false;
+let maxRms = 0;   // loudest sample since the last device switch (dead-mic detector)
 function meterLoop() {
   micLevel *= 0.85;                                  // smooth decay between samples
   const pct = Math.min(100, micLevel / 0.15 * 100);
@@ -105,7 +106,7 @@ function meterLoop() {
 }
 
 const TAG_AUDIO = 0, TAG_VIDEO = 1, TAG_FLUSH = 2;
-let ws, actx, nextTime = 0;
+let ws, actx, nextTime = 0, started = false, kicked = false;
 const activeSrc = new Set();
 
 // --- mic capture worklet: downsample the browser's native rate to 16 kHz PCM16 ---
@@ -155,10 +156,21 @@ function connectWS() {
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => setStatus('Conectado — habla con Eva 🎙️');
-  ws.onclose = () => setStatus('Desconectado');
+  ws.onclose = () => {   // kiosk resilience: reconnect on drop / server restart
+    if (kicked) { setStatus('Eva se abrió en otra pantalla — recarga aquí para retomarla'); return; }
+    setStatus('Desconectado — reintentando…');
+    if (started) setTimeout(connectWS, 3000);
+  };
   ws.onerror = () => setStatus('Error de conexión');
   ws.onmessage = (e) => {
-    if (typeof e.data === 'string') { try { setStatus(JSON.parse(e.data).msg); } catch (x) {} return; }
+    if (typeof e.data === 'string') {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'kicked') kicked = true;
+        if (m.msg) setStatus(m.msg);
+      } catch (x) {}
+      return;
+    }
     const tag = new Uint8Array(e.data, 0, 1)[0];
     const payload = e.data.slice(1);
     if (tag === TAG_AUDIO) playPCM(payload);
@@ -182,6 +194,7 @@ function sendPCM16(i16) {
   let sum = 0; for (let i = 0; i < i16.length; i++) { const v = i16[i] / 32768; sum += v * v; }
   const rms = i16.length ? Math.sqrt(sum / i16.length) : 0;
   if (rms > micLevel) micLevel = rms;
+  if (rms > maxRms) maxRms = rms;
   if (rms > 0.01) micEver = 1;
 }
 function downsampleI16(f32, inRate) {
@@ -230,9 +243,15 @@ function rebuildCapture(stream) {
 
 async function applyMic(deviceId) {
   try {
-    const s = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: deviceId ? { exact: deviceId } : undefined,
-               echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    let s;
+    try {
+      s = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: deviceId ? { exact: deviceId } : undefined,
+                 echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    } catch (e0) {   // old Android: processing constraints can fail — retry bare
+      s = await navigator.mediaDevices.getUserMedia({
+        audio: deviceId ? { deviceId: { exact: deviceId } } : true });
+    }
     if (micStream) micStream.getAudioTracks().forEach(t => t.stop());   // stop only the old mic
     micStream = s;
     rebuildCapture(s);
@@ -259,42 +278,101 @@ async function refreshMicList() {
 
 async function start() {
   overlay.style.display = 'none';
+  started = true;
   // create + resume the AudioContext *inside* the tap, before any await —
   // otherwise Android drops the user-gesture and the context stays suspended
+  // ask for 16 kHz (Gemini's rate): avoids resampling AND dodges old-Android
+  // HALs that deliver silence when WebAudio runs at an unsupported rate
+  const AC = window.AudioContext || window.webkitAudioContext;
   try {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
+    actx = new AC({ sampleRate: 16000 });
     actx.resume();
-  } catch (e) { setStatus('Audio no soportado: ' + e.message); }
+  } catch (e0) {
+    try {
+      actx = new AC();
+      actx.resume();
+    } catch (e) { setStatus('Audio no soportado: ' + e.message); }
+  }
 
-  setStatus('Pidiendo cámara y micrófono…');
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: { facingMode: 'user', width: { ideal: 640 } }
-    });
-  } catch (err) {
-    try {   // some Android browsers reject detailed constraints — retry simplest
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-    } catch (err2) {
-      setStatus('No se pudo abrir cámara/micrófono: ' + err2.message);
-      overlay.style.display = 'flex';
+  // connect FIRST so Eva always appears; mic/camera are progressive extras
+  // (a kiosk without camera must still work)
+  connectWS();
+
+  // kiosk telemetry + self-healing: old Android drops the mic track, suspends
+  // the AudioContext, or defaults to a dead input device — detect and recover.
+  // Registered BEFORE getUserMedia so we still get reports if the permission
+  // prompt hangs (each new tunnel URL is a new origin -> Chrome asks again).
+  let devList = [], devIdx = -1, lastSwitch = performance.now();
+  setInterval(async () => {
+    const tr = micStream && micStream.getAudioTracks()[0];
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ diag: {
+        actx: actx ? (actx.state + '@' + actx.sampleRate) : 'none',
+        mic: tr ? (tr.readyState + (tr.muted ? '/muted' : '/live')) : 'none',
+        label: tr ? tr.label : '', rms: +maxRms.toFixed(4)
+      }}));
+    }
+    if (actx && actx.state === 'suspended') { try { await actx.resume(); } catch (e) {} }
+    if (!micStream) return;   // still waiting for the permission prompt
+    if (started && (!tr || tr.readyState === 'ended')) {
+      setStatus('Micrófono se cayó — reintentando…');
+      applyMic(devIdx >= 0 && devList[devIdx] ? devList[devIdx].deviceId : undefined);
+      lastSwitch = performance.now(); maxRms = 0;
       return;
     }
-  }
-  selfVid.srcObject = stream;
+    // dead-mic hunt: 12 s of absolute silence (not even noise floor) means this
+    // input is fake/dead — cycle to the next one until something is audible
+    if (started && tr && performance.now() - lastSwitch > 12000 && maxRms < 0.002) {
+      try {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        devList = devs.filter(d => d.kind === 'audioinput');
+      } catch (e) {}
+      if (devList.length > 1) {
+        devIdx = (devIdx + 1) % devList.length;
+        const d = devList[devIdx];
+        setStatus('Mic en silencio — probando: ' + (d.label || ('micrófono ' + (devIdx + 1))));
+        applyMic(d.deviceId);
+        lastSwitch = performance.now(); maxRms = 0;
+      }
+    }
+  }, 5000);
 
-  if (!stream.getAudioTracks().length) setStatus('⚠️ Sin micrófono: revisa el permiso del navegador');
-
-  micBox.style.display = 'flex';
-  meterLoop();
-  if (actx) {
-    if (actx.state === 'suspended') { try { await actx.resume(); } catch (e) {} }
-    micStream = stream;
-    rebuildCapture(stream);
-    refreshMicList();
+  setStatus('Pidiendo cámara y micrófono…');
+  let stream = null;
+  const gum = (c) => navigator.mediaDevices.getUserMedia(c);
+  const audioC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  try {
+    stream = await gum({ audio: audioC, video: { facingMode: 'user', width: { ideal: 640 } } });
+  } catch (e1) {
+    try {   // some Android browsers reject detailed constraints — retry simplest
+      stream = await gum({ audio: true, video: true });
+    } catch (e2) {
+      try {   // no camera (typical kiosk): audio only
+        stream = await gum({ audio: audioC });
+      } catch (e3) {
+        setStatus('⚠️ Sin micrófono: Eva se ve pero no te escucha (' + e3.message + ')');
+      }
+    }
   }
-  connectWS();
+
+  if (stream) {
+    selfVid.srcObject = stream;
+    if (stream.getAudioTracks().length) {
+      micBox.style.display = 'flex';
+      meterLoop();
+      if (actx) {
+        if (actx.state === 'suspended') { try { await actx.resume(); } catch (e) {} }
+        micStream = stream;
+        rebuildCapture(stream);
+        refreshMicList();
+      }
+    } else {
+      setStatus('⚠️ Sin micrófono: revisa el permiso del navegador');
+    }
+    if (!stream.getVideoTracks().length) selfVid.style.display = 'none';
+  } else {
+    selfVid.style.display = 'none';
+  }
 
   // camera frames to Gemini (~1 fps)
   const cap = document.createElement('canvas');

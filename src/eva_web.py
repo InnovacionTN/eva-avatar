@@ -114,12 +114,32 @@ async def ws_handler(request):
     ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024)
     await ws.prepare(request)
 
-    if app["busy"]:
-        await ws.send_json({"type": "error", "msg": "Eva is busy with another session."})
-        await ws.close()
-        return ws
-    app["busy"] = True
-    print("[web] client connected")
+    # kiosk-first: a new client takes over — kick any previous (possibly stale)
+    # session instead of rejecting, so a phone left connected can't lock Eva out
+    state = {"running": True}
+    sess = app["session"]
+    if sess["cur"] is not None:
+        old = sess["cur"]
+        print("[web] new client: taking over the active session", flush=True)
+        old["state"]["running"] = False
+        try:
+            # tell the old page it was replaced so it does NOT auto-reconnect
+            # (otherwise two open tabs kick each other in an endless loop)
+            await old["ws"].send_json({"type": "kicked",
+                                       "msg": "Eva se abrió en otra pantalla"})
+        except Exception:
+            pass
+        try:
+            await old["ws"].close()
+        except Exception:
+            pass
+        for _ in range(50):            # wait for the old handler's cleanup
+            if sess["cur"] is None:
+                break
+            await asyncio.sleep(0.1)
+    mine = {"ws": ws, "state": state}
+    sess["cur"] = mine
+    print("[web] client connected", flush=True)
 
     loop = asyncio.get_running_loop()
     speaker = WebSpeaker()
@@ -128,8 +148,7 @@ async def ws_handler(request):
     mic_q = asyncio.Queue()
     video_q = asyncio.Queue(maxsize=2)
     out_q = asyncio.Queue()
-    state = {"running": True}
-    st = {"gem_audio": 0, "turns": 0}
+    st = {"gem_audio": 0, "turns": 0, "mic_pkts": 0, "mic_peak": 0.0, "mic_gated": 0}
 
     # reuse GeminiVoice only for its client/config helpers
     vision_on = app["vision"]
@@ -146,11 +165,16 @@ async def ws_handler(request):
                 if tag == TAG_AUDIO:
                     s = np.frombuffer(payload, dtype=np.int16).astype(np.float32) / 32768.0
                     if s.size:
-                        meter.update(min(1.0, float(np.sqrt(np.mean(s ** 2))) / 0.08))
+                        rms = float(np.sqrt(np.mean(s ** 2)))
+                        meter.update(min(1.0, rms / 0.08))
+                        st["mic_pkts"] += 1
+                        st["mic_peak"] = max(st["mic_peak"], rms)
                     # mute the mic while Eva talks AND for ~1.5s after, so her
                     # echo off the phone speaker never reaches Gemini
                     if not speaker.busy(1.5):
                         mic_q.put_nowait(payload)
+                    else:
+                        st["mic_gated"] += 1
                 elif tag == TAG_VIDEO:
                     if video_q.full():
                         try:
@@ -165,6 +189,8 @@ async def ws_handler(request):
                     continue
                 if cmd.get("gesture"):
                     renderer.trigger_gesture(cmd["gesture"])
+                elif cmd.get("diag"):
+                    print(f"[web] diag: {cmd['diag']}", flush=True)
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                 break
         state["running"] = False
@@ -184,11 +210,19 @@ async def ws_handler(request):
                     async def sender():
                         # batch the browser's tiny fragments to ~100 ms (the
                         # cadence the local app uses) and stream continuously;
-                        # Gemini's automatic VAD finds the turns
+                        # Gemini's automatic VAD finds the turns.
+                        # CRITICAL: when the browser stalls (phone screen off,
+                        # app switch, kiosk hiccup) we inject silence — VAD only
+                        # closes a turn after hearing trailing silence; a stream
+                        # that just stops leaves the turn open forever.
                         buf = bytearray()
                         CHUNK = SEND_RATE // 10 * 2   # 100 ms of 16-bit PCM
+                        SILENCE = bytes(CHUNK)
                         while state["running"]:
-                            buf.extend(await mic_q.get())
+                            try:
+                                buf.extend(await asyncio.wait_for(mic_q.get(), timeout=0.15))
+                            except asyncio.TimeoutError:
+                                buf.extend(SILENCE)
                             if len(buf) >= CHUNK:
                                 data = bytes(buf); buf.clear()
                                 await session.send_realtime_input(
@@ -270,8 +304,21 @@ async def ws_handler(request):
             if leftover > 0:
                 time.sleep(leftover)
 
+    async def stats_logger():
+        # heartbeat: is mic audio arriving from the browser, and how loud?
+        last = 0
+        while state["running"]:
+            await asyncio.sleep(5)
+            print(f"[web] mic: {st['mic_pkts'] - last} pkts/5s "
+                  f"(peak {st['mic_peak']:.3f}, gated {st['mic_gated']}) | "
+                  f"gemini audio {st['gem_audio'] // 1024} kB, turns {st['turns']}",
+                  flush=True)
+            last = st["mic_pkts"]
+            st["mic_peak"] = 0.0
+
     rt = threading.Thread(target=render_thread, daemon=True)
     rt.start()
+    stats_task = asyncio.create_task(stats_logger())
     recv_task = asyncio.create_task(browser_recv())
     send_task = asyncio.create_task(browser_send())
     gem_task = asyncio.create_task(gemini_session())
@@ -279,21 +326,37 @@ async def ws_handler(request):
         await recv_task                      # returns when the browser disconnects
     finally:
         state["running"] = False
-        for tk in (send_task, gem_task):
+        for tk in (send_task, gem_task, stats_task):
             tk.cancel()
-        await asyncio.gather(send_task, gem_task, return_exceptions=True)
+        await asyncio.gather(send_task, gem_task, stats_task, return_exceptions=True)
         rt.join(timeout=2)
-        app["busy"] = False
+        if sess["cur"] is mine:
+            sess["cur"] = None
         print("[web] client disconnected", flush=True)
     return ws
 
 
+NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache", "Expires": "0"}
+
+
 async def index_handler(request):
     # no-cache so kiosk/Android browsers never serve a stale build
-    return web.FileResponse(
-        os.path.join(WEB_DIR, "index.html"),
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                 "Pragma": "no-cache", "Expires": "0"})
+    return web.FileResponse(os.path.join(WEB_DIR, "index.html"), headers=NO_CACHE)
+
+
+async def mictest_handler(request):
+    return web.FileResponse(os.path.join(WEB_DIR, "mictest.html"), headers=NO_CACHE)
+
+
+async def mictest_report(request):
+    # the kiosk mic-test page posts its per-device results here
+    try:
+        data = await request.json()
+    except Exception:
+        data = {"raw": await request.text()}
+    print(f"[mictest] {data}", flush=True)
+    return web.json_response({"ok": True})
 
 
 def main():
@@ -311,6 +374,9 @@ def main():
     ap.add_argument("--sway", type=float, default=1.0)
     ap.add_argument("--body-sway", type=float, default=1.6)
     ap.add_argument("--body-breath", type=float, default=1.0)
+    ap.add_argument("--source-max-dim", type=int, default=None,
+                    help="override FLP source_max_dim (default 1280; use 1600 for tall "
+                         "outputs like a vertical kiosk, costs ~0.7 fps)")
     ap.add_argument("--no-vision", action="store_true",
                     help="disable sending the camera to Gemini (audio-only)")
     args = ap.parse_args()
@@ -321,14 +387,17 @@ def main():
 
     renderer = ep.EvaRenderer(args.source, pasteback=True, lip_gain=args.lip_gain,
                               sway=args.sway, body_motion=body_motion,
-                              body_sway=args.body_sway, body_breath=args.body_breath)
+                              body_sway=args.body_sway, body_breath=args.body_breath,
+                              source_max_dim=args.source_max_dim)
 
     app = web.Application()
     app["renderer"] = renderer
     app["args"] = args
-    app["busy"] = False
+    app["session"] = {"cur": None}   # mutable holder: the one active ws session
     app["vision"] = not args.no_vision
     app.router.add_get("/", index_handler)
+    app.router.add_get("/mictest", mictest_handler)
+    app.router.add_post("/mictest-report", mictest_report)
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/web", WEB_DIR)
 

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test de micrófonos</title>
+<style>
+  body { background: #000; color: #eee; font-family: system-ui, sans-serif;
+         padding: 16px; font-size: 15px; }
+  h1 { font-size: 20px; }
+  .dev { margin: 10px 0; padding: 10px; border: 1px solid #333; border-radius: 8px; }
+  .ok { color: #43d977; font-weight: 700; }
+  .bad { color: #ff6b6b; }
+  button { background: #ff7a00; color: #000; border: none; border-radius: 8px;
+           padding: 12px 22px; font-size: 16px; font-weight: 700; }
+  audio { width: 100%; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Test de micrófonos del kiosko</h1>
+<p>Prueba cada entrada de audio por dos rutas (WebAudio y grabadora del navegador).
+   Cuando diga <b>HABLA AHORA</b>, habla fuerte y cerca.</p>
+<button id="go">▶ Probar todos los micrófonos</button>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out');
+function line(html) {
+  const d = document.createElement('div'); d.className = 'dev';
+  d.innerHTML = html; out.appendChild(d); return d;
+}
+async function report(data) {
+  try {
+    await fetch('/mictest-report', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  } catch (e) {}
+}
+
+async function testDevice(d, idx) {
+  const name = d.label || ('mic ' + (idx + 1));
+  const el = line('<b>' + name + '</b><br>abriendo…');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: d.deviceId } } });
+  } catch (e) {
+    el.innerHTML = '<b>' + name + '</b> <span class="bad">no abre: ' + e.name + '</span>';
+    await report({ dev: name, err: e.name });
+    return;
+  }
+  const tr = stream.getAudioTracks()[0];
+  const settings = tr && tr.getSettings ? tr.getSettings() : {};
+
+  // path 1: WebAudio live peak for 4 s (the path Eva uses)
+  let waPeak = 0, ac = null;
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    await ac.resume();
+    const src = ac.createMediaStreamSource(stream);
+    const sp = ac.createScriptProcessor(4096, 1, 1);
+    const sink = ac.createGain(); sink.gain.value = 0; sink.connect(ac.destination);
+    sp.onaudioprocess = (ev) => {
+      const b = ev.inputBuffer.getChannelData(0);
+      let s = 0;
+      for (let i = 0; i < b.length; i++) s += b[i] * b[i];
+      const r = Math.sqrt(s / b.length);
+      if (r > waPeak) waPeak = r;
+    };
+    src.connect(sp); sp.connect(sink);
+  } catch (e) {}
+
+  // path 2: MediaRecorder 4 s (independent native pipeline)
+  let chunks = [], recErr = null, rec = null;
+  try {
+    rec = new MediaRecorder(stream);
+    rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.start(500);
+  } catch (e) { recErr = e.name || String(e); }
+
+  el.innerHTML = '<b>' + name + '</b> — grabando 4 s, <b>HABLA AHORA</b>…';
+  await new Promise(r => setTimeout(r, 4000));
+  try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (e) {}
+  await new Promise(r => setTimeout(r, 400));
+
+  const recBytes = chunks.reduce((a, b) => a + b.size, 0);
+  let recPeak = null, url = null;
+  if (recBytes) {
+    const blob = new Blob(chunks, { type: (rec && rec.mimeType) || 'audio/webm' });
+    url = URL.createObjectURL(blob);
+    try {   // decode the recording to measure real loudness
+      const ab = await blob.arrayBuffer();
+      const dec = await ac.decodeAudioData(ab.slice(0));
+      const ch = dec.getChannelData(0);
+      let mx = 0;
+      for (let i = 0; i < ch.length; i++) { const v = Math.abs(ch[i]); if (v > mx) mx = v; }
+      recPeak = mx;
+    } catch (e) { recPeak = null; }
+  }
+  stream.getTracks().forEach(t => t.stop());
+  try { if (ac) ac.close(); } catch (e) {}
+
+  const waOk = waPeak > 0.003;
+  const mrOk = recPeak !== null ? recPeak > 0.003 : recBytes > 4000;
+  el.innerHTML = '<b>' + name + '</b> (' + (settings.sampleRate || '?') + ' Hz)<br>' +
+    'WebAudio: <span class="' + (waOk ? 'ok' : 'bad') + '">' + (waOk ? 'SÍ OYE' : 'silencio') +
+    '</span> (pico ' + waPeak.toFixed(3) + ')<br>' +
+    'Grabadora: <span class="' + (mrOk ? 'ok' : 'bad') + '">' + (mrOk ? 'SÍ OYE' : 'silencio') +
+    '</span> (' + recBytes + ' bytes' +
+    (recPeak !== null ? (', pico ' + recPeak.toFixed(3)) : '') +
+    (recErr ? (', err ' + recErr) : '') + ')' +
+    (url ? '<br><audio controls src="' + url + '"></audio>' : '');
+  await report({ dev: name, settings: settings, webaudio_peak: +waPeak.toFixed(4),
+                 rec_bytes: recBytes, rec_peak: recPeak === null ? null : +recPeak.toFixed(4),
+                 rec_err: recErr });
+}
+
+document.getElementById('go').onclick = async () => {
+  out.innerHTML = '';
+  try {   // prime permission so enumerateDevices returns labels
+    (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop());
+  } catch (e) { line('<span class="bad">Permiso de micrófono denegado: ' + e.name + '</span>'); }
+  let devs = [];
+  try {
+    devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+  } catch (e) {}
+  line('Dispositivos de entrada: ' + devs.length);
+  await report({ devices: devs.map(d => d.label || d.deviceId.slice(0, 8)) });
+  for (let i = 0; i < devs.length; i++) await testDevice(devs[i], i);
+  line('<b>Listo.</b> Si alguna fila dice <span class="ok">SÍ OYE</span>, ' +
+       'reproduce su grabación para confirmarlo con tus oídos.');
+};
+</script>
+</body>
+</html>
