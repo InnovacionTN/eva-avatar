@@ -21,7 +21,7 @@ echo Starting Eva...  (talk to her in Spanish; press Q in the window to quit)
 echo Gesture keys ^(focus the window first^): n=nod  m=shake  t=tilt  l=lean-in  g=shrug
 echo.
 
-"%PY%" src\eva_platica.py --source assets\eva_body.png --preview --no-virtual-cam --vision %*
+"%PY%" src\eva_platica.py --source assets\eva_body_glow.png --preview --no-virtual-cam --vision %*
 
 REM Keep the window open if Eva exits with an error, so you can read it
 if errorlevel 1 (

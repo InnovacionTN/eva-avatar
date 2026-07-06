@@ -17,6 +17,7 @@ import asyncio
 import glob
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -265,6 +266,98 @@ class PhonemeScheduler:
         return out
 
 
+# Conversational gesture cues, matched against Eva's own words (lowercased,
+# accents kept — Gemini transcribes Spanish with proper accents/punctuation).
+# Listed in priority order: on overlapping matches the earlier rule wins, so
+# "claro que no" shakes instead of nodding on "claro".
+GESTURE_CUE_RULES = [
+    ("shrug", r"no (?:lo |te )?s[eé]\b|qui[eé]n sabe|tal vez|quiz[aá]s?\b|"
+              r"depende\b|no estoy segur|ni idea"),
+    ("shake", r"claro que no|para nada|nunca\b|jam[aá]s\b|tampoco\b|"
+              r"de ninguna manera|\bno[,.]|(?:^|[.!?]\s+)no\b"),
+    ("nod",   r"\bs[ií][,.!]|\bsí\b|claro\b|por supuesto|exacto\b|as[ií] es|"
+              r"de acuerdo|correcto\b|desde luego|efectivamente|perfecto\b|"
+              r"excelente\b|\bhola\b|bienvenid"),
+    ("tilt",  r"[¿?]"),
+    ("lean",  r"[¡!]|te cuento|f[ií]jate|imag[ií]nate|\bmira\b"),
+]
+
+
+class GestureCuer:
+    """Turns Eva's output transcription into timed head gestures.
+
+    Each new transcript fragment is scanned for conversational cues (sí -> nod,
+    no -> shake, ¿? -> tilt, ...) and the gesture is scheduled for the moment
+    that word is actually spoken, using the same buffered-audio alignment as
+    the PhonemeScheduler. The render loop polls and fires them.
+    """
+
+    COOLDOWN_MS = 2500.0   # min gap between auto gestures (no head-bobbling)
+    REPEAT_MS = 6000.0     # min gap between two of the SAME gesture (a "¿...?"
+                           # must not tilt on both the opening and closing mark)
+    LEAD_MS = 300.0        # fire early so the gesture peaks ON the word
+    STALE_MS = 900.0       # drop cues whose moment already passed (lag/seek)
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.rules = [(g, re.compile(p)) for g, p in GESTURE_CUE_RULES]
+        self.turn_text = ""
+        self.last_sched_ms = 0.0
+        self.last_fire_ms = -1e9
+        self.last_fire_of = {}   # gesture -> last scheduled fire_ms
+        self.queue = []          # (fire_ms, gesture), fire_ms ascending
+
+    def on_transcript(self, frag, played_ms, fed_ms):
+        if not frag:
+            return
+        with self._lock:
+            # transcription may arrive as fragments or cumulative text
+            if self.turn_text and frag.startswith(self.turn_text):
+                new = frag[len(self.turn_text):]
+                self.turn_text = frag
+            else:
+                new = frag
+                self.turn_text += frag
+            low = new.lower()
+            if not low.strip():
+                return
+            start = max(self.last_sched_ms, played_ms)
+            end = max(fed_ms, start + 60.0 * len(low))
+            self.last_sched_ms = end
+            hits = []
+            for pri, (g, rx) in enumerate(self.rules):
+                for m in rx.finditer(low):
+                    hits.append((m.start(), pri, g))
+            hits.sort()
+            for pos, _pri, g in hits:
+                fire = start + (end - start) * (pos / max(1, len(low)))
+                if fire - self.last_fire_ms < self.COOLDOWN_MS:
+                    continue
+                if fire - self.last_fire_of.get(g, -1e9) < self.REPEAT_MS:
+                    continue
+                self.queue.append((fire, g))
+                self.last_fire_ms = fire
+                self.last_fire_of[g] = fire
+
+    def poll(self, now_ms):
+        """Called from the render loop; returns a due gesture name or None."""
+        with self._lock:
+            while self.queue:
+                fire, g = self.queue[0]
+                if fire - self.LEAD_MS > now_ms:
+                    return None
+                self.queue.pop(0)
+                if now_ms - fire < self.STALE_MS:
+                    return g
+            return None
+
+    def clear(self, played_ms):
+        with self._lock:
+            self.queue = []
+            self.turn_text = ""
+            self.last_sched_ms = played_ms
+
+
 class UserVoiceMeter:
     """Tracks whether the human is currently speaking (with a short hangover
     so brief pauses between words don't flicker the state)."""
@@ -329,11 +422,165 @@ class MicStream:
 
 
 # --------------------------------------------------------------------------
+# BigQuery: venta real de Tiendas Neto (READ-ONLY, tablas fijas)
+# --------------------------------------------------------------------------
+# Eva nunca escribe SQL: Gemini llama consultar_ventas() con parámetros y el
+# SELECT se arma aquí, con las tablas fijas y filtros como query parameters
+# tipados. Solo consultas agregadas acotadas por fecha: la tabla de ventas
+# está particionada por Fecha, así que cada consulta responde en ~1-2 s sin
+# escanear los 44 GB. Los canales de venta especial (mayoreo/CEDIS/virtuales,
+# ~3% de la venta) se excluyen por default para que "la tienda que más vende"
+# sea una tienda real; incluir_canales_especiales=true los suma.
+class VentasBQ:
+    T_VENTAS = "`neto-cloud.analitica.ventas`"
+    T_TIENDAS = "`neto-cloud.analitica.tiendas`"
+    T_ARTICULOS = "`neto-cloud.analitica.articulos`"
+    COND_ESPECIAL = ("(ct.`Tipo Tienda` = 'Tienda Especial' "
+                     "OR UPPER(ct.Region) LIKE '%ESPECIAL%' "
+                     "OR ct.`Indicador Tienda` != 'TIENDA')")
+
+    # agrupar_por -> SELECT expr (None = total compañía)
+    DIMS = {
+        "total": None,
+        "dia": "CAST(v.Fecha AS STRING)",
+        "mes": "FORMAT_DATE('%Y-%m', v.Fecha)",
+        "region": "ct.Region",
+        "zona": "ct.Zona",
+        "estado": "ct.Estado",
+        "tienda": "ct.Tienda",
+        "division": "COALESCE(ca.Division, 'SIN CATALOGO')",
+        "categoria": "COALESCE(ca.Categoria, 'SIN CATALOGO')",
+        "articulo": "COALESCE(ca.Articulo, CAST(v.`Articulo Id` AS STRING))",
+    }
+    # filtro -> columna (siempre via UPPER(col) LIKE %valor%)
+    FILTERS = {"region": "ct.Region", "zona": "ct.Zona",
+               "estado": "ct.Estado", "tienda": "ct.Tienda",
+               "division": "ca.Division", "categoria": "ca.Categoria",
+               "articulo": "ca.Articulo"}
+
+    def __init__(self):
+        import json as _json
+        from google.oauth2 import service_account
+        from google.cloud import bigquery
+        self.bigquery = bigquery
+        raw = os.environ.get("GOOGLE_BIG_QUERY_CREDENTIALS_JSON")
+        if not raw:
+            raise RuntimeError("GOOGLE_BIG_QUERY_CREDENTIALS_JSON no está en .env")
+        info = _json.loads(raw)
+        # nota: correr un SELECT requiere el scope completo (crea un query job);
+        # el "solo lectura" lo garantiza este código: únicamente arma SELECTs
+        # sobre las 3 tablas fijas, jamás DML/DDL
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/bigquery"])
+        self.client = bigquery.Client(credentials=creds, project=info["project_id"])
+        # rango de fechas con datos: define los defaults y se anuncia en el
+        # system prompt para que Eva no prometa datos de "hoy" ni de 2024/2025
+        row = next(iter(self.client.query(
+            f"SELECT MIN(Fecha) mn, MAX(Fecha) mx FROM {self.T_VENTAS}").result()))
+        self.min_fecha, self.max_fecha = row.mn, row.mx
+        print(f"[bq] ventas conectadas (solo lectura): datos del "
+              f"{self.min_fecha} al {self.max_fecha}")
+
+    def declaration(self, types):
+        S, T = types.Schema, types.Type
+        return types.Tool(function_declarations=[types.FunctionDeclaration(
+            name="consultar_ventas",
+            description=(
+                "Consulta la venta real de Tiendas Neto (pesos y piezas) por rango "
+                f"de fechas, con filtros opcionales y agrupación. Los datos van del "
+                f"{self.min_fecha} al {self.max_fecha}."),
+            parameters=S(type=T.OBJECT, properties={
+                "fecha_inicio": S(type=T.STRING,
+                                  description="YYYY-MM-DD (default: 30 días antes de fecha_fin)"),
+                "fecha_fin": S(type=T.STRING,
+                               description="YYYY-MM-DD (default: fecha más reciente con datos)"),
+                "agrupar_por": S(type=T.STRING, enum=list(self.DIMS.keys()),
+                                 description="dimensión del desglose (default: total)"),
+                "region": S(type=T.STRING, description="filtra por nombre de región"),
+                "zona": S(type=T.STRING, description="filtra por zona"),
+                "estado": S(type=T.STRING, description="filtra por estado"),
+                "tienda": S(type=T.STRING, description="filtra por nombre de tienda"),
+                "division": S(type=T.STRING, description="filtra por división de artículo"),
+                "categoria": S(type=T.STRING, description="filtra por categoría de artículo"),
+                "articulo": S(type=T.STRING, description="filtra por nombre de artículo"),
+                "top": S(type=T.INTEGER, description="cuántas filas devolver (1-10, default 5)"),
+                "incluir_canales_especiales": S(type=T.BOOLEAN, description=(
+                    "default false: excluye ventas especiales/mayoreo, CEDIS y "
+                    "tiendas virtuales. Ponlo en true solo si piden la venta "
+                    "total con todo y canales especiales.")),
+            }))])
+
+    def consultar(self, fecha_inicio=None, fecha_fin=None, agrupar_por="total",
+                  top=5, incluir_canales_especiales=False, **filtros):
+        from datetime import date, timedelta
+        bq = self.bigquery
+        try:
+            f1 = date.fromisoformat(str(fecha_fin)) if fecha_fin else self.max_fecha
+            f1 = min(max(f1, self.min_fecha), self.max_fecha)
+            f0 = (date.fromisoformat(str(fecha_inicio)) if fecha_inicio
+                  else f1 - timedelta(days=29))
+            f0 = min(max(f0, self.min_fecha), self.max_fecha)
+            if f0 > f1:
+                f0, f1 = f1, f0
+            if (f1 - f0).days > 400:      # tope: nunca más de ~13 meses por consulta
+                f0 = f1 - timedelta(days=400)
+            dim = self.DIMS.get(str(agrupar_por or "total").lower())
+            dim_key = str(agrupar_por or "total").lower()
+            if dim_key not in self.DIMS:
+                dim_key, dim = "total", None
+            top = max(1, min(10, int(top or 5)))
+
+            params = [bq.ScalarQueryParameter("f0", "DATE", f0),
+                      bq.ScalarQueryParameter("f1", "DATE", f1)]
+            conds = []
+            if not incluir_canales_especiales:
+                conds.append(f"NOT {self.COND_ESPECIAL}")
+            for k, col in self.FILTERS.items():
+                val = filtros.get(k)
+                if val:
+                    conds.append(f"UPPER({col}) LIKE CONCAT('%', UPPER(@{k}), '%')")
+                    params.append(bq.ScalarQueryParameter(k, "STRING", str(val)))
+            art_dims = ("division", "categoria", "articulo")
+            need_art = dim_key in art_dims or any(filtros.get(k) for k in art_dims)
+            art_join = (f"LEFT JOIN {self.T_ARTICULOS} ca "
+                        "ON v.`Articulo Id` = ca.`Articulo Id`"
+                        if need_art else "")
+            sel = f"{dim} AS grupo, " if dim else ""
+            group = "GROUP BY grupo" if dim else ""
+            order = ("ORDER BY grupo" if dim_key in ("dia", "mes")
+                     else "ORDER BY venta_pesos DESC" if dim else "")
+            sql = f"""
+                SELECT {sel}
+                       ROUND(SUM(v.Monto), 0) AS venta_pesos,
+                       ROUND(SUM(v.Cantidad), 0) AS piezas,
+                       COUNT(DISTINCT v.`Tienda Id`) AS tiendas
+                FROM {self.T_VENTAS} v
+                JOIN {self.T_TIENDAS} ct ON v.`Tienda Id` = ct.`Tienda Id`
+                {art_join}
+                WHERE v.Fecha BETWEEN @f0 AND @f1
+                {'AND ' + ' AND '.join(conds) if conds else ''}
+                {group} {order}
+                LIMIT {top if dim else 1}"""
+            job = self.client.query(sql, job_config=bq.QueryJobConfig(
+                query_parameters=params,
+                maximum_bytes_billed=20 * 1024**3))   # techo de seguridad por consulta
+            filas = [{k: (float(v) if isinstance(v, (int, float)) else str(v))
+                      for k, v in dict(r).items()} for r in job.result(timeout=25)]
+            return {"periodo": f"{f0} a {f1}", "agrupado_por": dim_key,
+                    "moneda": "MXN", "filas": filas}
+        except Exception as e:
+            print(f"[bq] error en consulta: {e}", flush=True)
+            return {"error": f"No pude consultar: {type(e).__name__}. "
+                             "Discúlpate brevemente y ofrece intentar de nuevo."}
+
+
+# --------------------------------------------------------------------------
 # Gemini Live session (runs on its own asyncio thread)
 # --------------------------------------------------------------------------
 class GeminiVoice(threading.Thread):
     def __init__(self, speaker, model=None, voice=None, allow_barge_in=False,
-                 mic_device=None, scheduler=None, vision=False, vision_camera=0,
+                 mic_device=None, scheduler=None, cuer=None, ventas=None,
+                 extra_context=None, vision=False, vision_camera=0,
                  vision_fps=1.0, debug_audio=False):
         super().__init__(daemon=True)
         self.speaker = speaker
@@ -342,6 +589,9 @@ class GeminiVoice(threading.Thread):
         self.allow_barge_in = allow_barge_in
         self.mic_device = mic_device
         self.scheduler = scheduler
+        self.cuer = cuer
+        self.ventas = ventas
+        self.extra_context = extra_context
         self.debug_audio = debug_audio
         self.vision = vision
         self.vision_camera = vision_camera
@@ -366,14 +616,30 @@ class GeminiVoice(threading.Thread):
             speech = types.SpeechConfig(voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice)))
         prompt = SYSTEM_PROMPT
+        if self.extra_context:
+            prompt += "\n\n" + self.extra_context
         if self.vision:
             prompt += (" Recibes imágenes en vivo de la cámara del equipo: puedes ver "
                        "lo que pasa frente a la computadora. Si te preguntan qué ves, "
                        "describe la imagen más reciente con naturalidad.")
+        tools = None
+        if self.ventas is not None:
+            tools = [self.ventas.declaration(types)]
+            prompt += (
+                "\n\nTienes la herramienta consultar_ventas, conectada a la venta real "
+                "de Tiendas Neto (datos diarios por tienda y artículo, del "
+                f"{self.ventas.min_fecha} al {self.ventas.max_fecha}). "
+                "Úsala siempre que te pregunten por ventas, "
+                "cifras o comparativos; nunca inventes números. Antes de consultar di una "
+                "frase breve como 'déjame checarlo'. Al responder, redondea y di las "
+                "cifras de forma natural ('unos setenta y siete millones de pesos'), "
+                "menciona el periodo, y si piden datos más recientes que "
+                f"{self.ventas.max_fecha}, aclara hasta qué fecha tienes información.")
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=types.Content(parts=[types.Part(text=prompt)]),
             speech_config=speech,
+            tools=tools,
             # text of what Eva says, as she says it -> drives the phoneme mouth
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
@@ -422,13 +688,30 @@ class GeminiVoice(threading.Thread):
 
         async def receiver():
             got_audio = 0
+            loop_ = asyncio.get_running_loop()
             while True:
                 async for message in session.receive():
+                    tc = getattr(message, "tool_call", None)
+                    if tc is not None and self.ventas is not None:
+                        for fc in tc.function_calls:
+                            args = dict(fc.args or {})
+                            print(f"[bq] Eva consulta: {args}", flush=True)
+                            t0 = time.time()
+                            # run in a worker thread: audio keeps flowing meanwhile
+                            result = await loop_.run_in_executor(
+                                None, lambda a=args: self.ventas.consultar(**a))
+                            print(f"[bq] respuesta en {time.time() - t0:.1f}s", flush=True)
+                            await session.send_tool_response(function_responses=[
+                                types.FunctionResponse(id=fc.id, name=fc.name,
+                                                       response=result)])
+                        continue
                     sc = getattr(message, "server_content", None)
                     if sc is not None and getattr(sc, "interrupted", False):
                         self.speaker.clear()
                         if self.scheduler is not None:
                             self.scheduler.clear(self.speaker.now_ms())
+                        if self.cuer is not None:
+                            self.cuer.clear(self.speaker.now_ms())
                     if message.data:
                         if self.debug_audio:
                             got_audio += len(message.data)
@@ -437,11 +720,15 @@ class GeminiVoice(threading.Thread):
                         self.speaker.feed(message.data)
                     if self.debug_audio and sc is not None and getattr(sc, "turn_complete", False):
                         print(f"[gemini] turn complete ({got_audio} bytes this session)")
-                    if sc is not None and self.scheduler is not None:
+                    if sc is not None and (self.scheduler is not None
+                                           or self.cuer is not None):
                         tr = getattr(sc, "output_transcription", None)
                         if tr is not None and getattr(tr, "text", None):
-                            self.scheduler.on_transcript(tr.text, self.speaker.now_ms(),
-                                                         self.speaker.fed_ms())
+                            now, fed = self.speaker.now_ms(), self.speaker.fed_ms()
+                            if self.scheduler is not None:
+                                self.scheduler.on_transcript(tr.text, now, fed)
+                            if self.cuer is not None:
+                                self.cuer.on_transcript(tr.text, now, fed)
 
         async def vision_sender():
             cap = cv2.VideoCapture(self.vision_camera, cv2.CAP_DSHOW)
@@ -541,12 +828,15 @@ GESTURE_KEYS = {ord("n"): "nod", ord("m"): "shake", ord("t"): "tilt",
 class EvaRenderer:
     def __init__(self, source, pasteback=True, lip_gain=0.8, sway=1.0, smile_gain=0.0,
                  body_motion=False, body_sway=1.0, body_breath=1.0,
-                 shoulder_y=0.20, hip_y=0.52):
+                 shoulder_y=0.20, hip_y=0.52, ankle_y=0.93, weight_shift=1.0,
+                 leg_life=1.0, source_max_dim=None):
         from omegaconf import OmegaConf
         from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline
 
         cfg = OmegaConf.load(os.path.join(FLP_ROOT, "configs", "trt_infer.yaml"))
         cfg.infer_params.flag_pasteback = pasteback
+        if source_max_dim:
+            cfg.infer_params.source_max_dim = int(source_max_dim)
         print("[init] loading TensorRT engines...")
         self.pipe = FasterLivePortraitPipeline(cfg=cfg, is_animal=False)
         if not self.pipe.prepare_source(source, realtime=True):
@@ -642,7 +932,46 @@ class EvaRenderer:
             # shrug weight: a band peaking at the shoulders (low at the head and
             # below the chest) so a shrug lifts the shoulders, not the whole body
             self.bm_shrug_w = self.torch.exp(-0.5 * ((row - (shoulder_y + 0.03)) / 0.05) ** 2).view(1, H, 1)
-            print(f"[init] body motion on (shoulder_y={shoulder_y}, hip_y={hip_y})")
+            # weight-shift: hips carry the most lateral motion, the legs lean
+            # with them down to the ankles (feet stay planted), and the torso
+            # above follows partially — the classic standing weight shift
+            upper = 0.3 + 0.7 * self.torch.clamp(
+                (row - shoulder_y) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0)
+            lower = self.torch.clamp((ankle_y - row) / max(1e-3, ankle_y - hip_y), 0.0, 1.0)
+            self.bm_shift_w = self.torch.where(row <= hip_y, upper, lower).view(1, H, 1)
+            # postural sway: a standing body is an inverted pendulum pivoting at
+            # the ankles — displacement grows linearly from 0 at the ankles to
+            # max at the head, so the legs themselves are never fully frozen
+            self.bm_pend_w = self.torch.clamp(
+                (ankle_y - row) / max(1e-3, ankle_y), 0.0, 1.0).view(1, H, 1)
+            # counter-balance: when the shoulders lean one way the hips push the
+            # other way — peak at the hips, fading to 0 at the ankles
+            self.bm_counter_w = self.torch.where(
+                row > hip_y, lower, self.torch.zeros_like(row)).view(1, H, 1)
+            # contrapposto hip hike: resting weight on one leg lifts that hip and
+            # drops the other — a column-signed vertical shear in a band around
+            # the hip line (gx is -1 at the left edge, +1 at the right)
+            hip_band = self.torch.exp(-0.5 * ((row - hip_y) / 0.09) ** 2).view(1, H, 1)
+            self.bm_hiptilt_w = hip_band * gx.unsqueeze(0)  # (1,H,W)
+            # settle dip: shifting weight bends the knees, so everything above
+            # them drops a touch during the transition (ramps to 0 at the ankles)
+            knee_y = 0.5 * (hip_y + ankle_y)
+            dip_lower = self.torch.clamp((ankle_y - row) / max(1e-3, ankle_y - knee_y), 0.0, 1.0)
+            self.bm_dip_w = self.torch.where(row < knee_y, self.torch.ones_like(w),
+                                             dip_lower).view(1, H, 1)
+            # weight-shift state: a slow random walk, not a metronome — a new
+            # stance every 6-14 s, eased in over ~2 s
+            self.ws_gain = weight_shift
+            self.ws_cur = 0.0
+            self.ws_target = 0.0
+            self.ws_next_t = random.uniform(3.0, 6.0)   # vs tnow (t - t0)
+            # leg-life: scales the continuous lower-body motion (pendulum sway,
+            # idle hip drift, hip hike, knee-breath); random phases so the
+            # incommensurate periods never visibly loop
+            self.leg_life = leg_life
+            self.bm_ph = [random.uniform(0.0, 2 * np.pi) for _ in range(4)]
+            print(f"[init] body motion on (shoulder_y={shoulder_y}, hip_y={hip_y}, "
+                  f"ankle_y={ankle_y}, weight_shift={weight_shift}, leg_life={leg_life})")
 
         # ---- triggerable gestures ----
         self._g_lock = threading.Lock()
@@ -858,15 +1187,19 @@ class EvaRenderer:
         if self.pasteback:
             out = paste_back_pytorch(out, self.M, self.base_tensor.clone(), self.mask_ori)
         if self.body_motion:
-            out = self._body_warp(out, tnow, e, speaking, listening, shrug=g_shrug)
+            out = self._body_warp(out, tnow, dt, e, speaking, listening, shrug=g_shrug)
         return out.to(dtype=self.torch.uint8).cpu().numpy()
 
-    def _body_warp(self, out, tnow, e, speaking, listening, shrug=0.0):
-        """Sway the upper body + breathe the chest. `out` is an HxWx3 GPU tensor.
+    def _body_warp(self, out, tnow, dt, e, speaking, listening, shrug=0.0):
+        """Sway the upper body + breathe the chest + shift the standing weight.
+        `out` is an HxWx3 GPU tensor.
 
         Sway is phase-locked to the head yaw (same 8.7 s period, slight lag) so
         head and torso move as one body; amplitude grows a little while she
         speaks and quiets while she listens. Breathing is a slow chest swell.
+        The weight shift moves the hips (legs leaning with them, feet planted)
+        to a new random stance every 6-14 s, with a small knee dip while the
+        shift is in motion so it reads as real weight transfer.
         """
         np_sin = np.sin
         amp = self.body_sway * (1.0 + 0.5 * e)
@@ -881,9 +1214,43 @@ class EvaRenderer:
         dy = -float(self.body_breath * 3.0 * breath) * 2.0 / self.bm_H
         # shrug: briefly lift the shoulder band upward
         shrug_lift = -float(shrug * 7.0) * 2.0 / self.bm_H
+        # ---- weight shift ----
+        if self.ws_gain > 0.0:
+            if tnow >= self.ws_next_t:
+                if random.random() < 0.25:   # sometimes just square up again
+                    self.ws_target = random.uniform(-0.2, 0.2)
+                else:
+                    self.ws_target = random.uniform(0.4, 1.0) * random.choice((-1.0, 1.0))
+                self.ws_next_t = tnow + random.uniform(6.0, 14.0)
+            self.ws_cur += (self.ws_target - self.ws_cur) * (1.0 - float(np.exp(-dt / 0.9)))
+        # idle hip drift: the stance keeps wandering a little between the big
+        # shifts so the hips never fully freeze into a photo
+        L = self.leg_life
+        ph = self.bm_ph
+        ws_idle = L * (0.10 * np_sin(2 * np.pi * tnow / 11.3 + ph[0])
+                       + 0.06 * np_sin(2 * np.pi * tnow / 5.9 + ph[1]))
+        shift_px = self.ws_gain * self.body_sway * 5.0 * (self.ws_cur + ws_idle)
+        shift_dx = float(shift_px) * 2.0 / self.bm_W
+        # ankle-pivot postural sway: slow whole-body lean, max at the head,
+        # zero at the feet — the thing real standing humans can't stop doing
+        pend_px = L * self.body_sway * (1.6 * np_sin(2 * np.pi * tnow / 9.4 + ph[2])
+                                        + 0.7 * np_sin(2 * np.pi * tnow / 4.3 + ph[3]))
+        pend_dx = float(pend_px) * 2.0 / self.bm_W
+        # contrapposto: the loaded hip rides up (and the other drops) with the
+        # weight shift; sign comes from the column-signed hip-tilt map
+        tilt_px = L * self.ws_gain * 3.5 * (self.ws_cur + 0.5 * ws_idle)
+        tilt_dy = -float(tilt_px) * 2.0 / self.bm_H
+        # knee-breath: the whole body above the knees rises a touch on inhale
+        settle_dy = -float(L * 1.1 * breath) * 2.0 / self.bm_H
+        # knee dip: proportional to how much of the shift is still in flight
+        dip_px = self.ws_gain * self.body_sway * 1.4 * min(1.0, abs(self.ws_target - self.ws_cur))
+        dip_dy = float(dip_px) * 2.0 / self.bm_H
         # grid_sample reads input at grid coords: to move content by +d, sample at -d
-        gx = self.bm_base[..., 0] - dx * self.bm_sway_w
-        gy = self.bm_base[..., 1] - dy * self.bm_breath_w - shrug_lift * self.bm_shrug_w
+        gx = (self.bm_base[..., 0] - dx * self.bm_sway_w - shift_dx * self.bm_shift_w
+              - pend_dx * self.bm_pend_w + 0.25 * dx * self.bm_counter_w)
+        gy = (self.bm_base[..., 1] - dy * self.bm_breath_w - shrug_lift * self.bm_shrug_w
+              - dip_dy * self.bm_dip_w - tilt_dy * self.bm_hiptilt_w
+              - settle_dy * self.bm_dip_w)
         grid = self.torch.stack((gx, gy), dim=-1)
         img = out.permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
         warped = self.F.grid_sample(img, grid, mode="bilinear",
@@ -978,6 +1345,26 @@ def main():
                     help="shoulder line as a fraction of image height (sway pivot top)")
     ap.add_argument("--hip-y", type=float, default=0.52,
                     help="hip line as a fraction of image height (sway pivot, planted below)")
+    ap.add_argument("--ankle-y", type=float, default=0.93,
+                    help="ankle line as a fraction of image height (weight shift "
+                         "fades to 0 here so the feet stay planted)")
+    ap.add_argument("--weight-shift", type=float, default=1.0,
+                    help="standing weight-shift amount: hips + legs slowly move "
+                         "to a new stance every 6-14 s (0 = off)")
+    ap.add_argument("--leg-life", type=float, default=1.0,
+                    help="continuous lower-body motion: ankle-pivot postural sway, "
+                         "idle hip drift, contrapposto hip hike, knee-breath (0 = off)")
+    ap.add_argument("--source-max-dim", type=int, default=None,
+                    help="override FLP source_max_dim (default 1280 from trt_infer.yaml; "
+                         "1600 costs ~0.7 fps and only shows on outputs taller than 1280)")
+    ap.add_argument("--no-auto-gestures", action="store_true",
+                    help="don't derive nod/shake/tilt/... from what Eva says "
+                         "(keyboard gestures still work)")
+    ap.add_argument("--contexto", default=os.path.join(PROJECT_ROOT, "assets", "eva_contexto.md"),
+                    help="archivo markdown con contexto extra para el system prompt "
+                         "(ej. Expo Neto 2026); se omite si no existe")
+    ap.add_argument("--no-bigquery", action="store_true",
+                    help="desactiva la herramienta consultar_ventas (BigQuery)")
     ap.add_argument("--no-pasteback", action="store_true")
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--no-virtual-cam", action="store_true")
@@ -1002,21 +1389,39 @@ def main():
                            lip_gain=args.lip_gain, sway=args.sway,
                            smile_gain=args.smile_gain, body_motion=body_motion,
                            body_sway=args.body_sway, body_breath=args.body_breath,
-                           shoulder_y=args.shoulder_y, hip_y=args.hip_y)
+                           shoulder_y=args.shoulder_y, hip_y=args.hip_y,
+                           ankle_y=args.ankle_y, weight_shift=args.weight_shift,
+                           leg_life=args.leg_life, source_max_dim=args.source_max_dim)
 
     speaker = None
     scheduler = None
+    cuer = None
     if not args.mute:
         speaker = SpeakerStream()
         speaker.start()
         if args.mouth == "fonemas" and renderer.templates is not None:
             scheduler = PhonemeScheduler(lead_ms=args.lip_lead)
+        if not args.no_auto_gestures:
+            cuer = GestureCuer()
+        extra_context = None
+        if args.contexto and os.path.exists(args.contexto):
+            with open(args.contexto, encoding="utf-8") as f:
+                extra_context = f.read()
+            print(f"[init] contexto cargado: {args.contexto}")
+        ventas = None
+        if not args.no_bigquery:
+            try:
+                ventas = VentasBQ()
+            except Exception as e:
+                print(f"[bq] sin BigQuery ({type(e).__name__}: {e}) - Eva no podrá "
+                      "consultar ventas")
         mic_dev = None
         if args.mic_device is not None:
             mic_dev = int(args.mic_device) if args.mic_device.isdigit() else args.mic_device
         voice = GeminiVoice(speaker, model=args.model, voice=args.voice,
                             allow_barge_in=args.allow_barge_in, mic_device=mic_dev,
-                            scheduler=scheduler, vision=args.vision,
+                            scheduler=scheduler, cuer=cuer, ventas=ventas,
+                            extra_context=extra_context, vision=args.vision,
                             vision_camera=args.vision_camera, vision_fps=args.vision_fps,
                             debug_audio=args.debug_audio)
         voice.start()
@@ -1024,6 +1429,7 @@ def main():
         if voice.fatal:
             sys.exit(f"[gemini] failed: {voice.fatal}")
         print(f"[init] mouth driver: {'fonemas' if scheduler else 'envelope'}")
+        print(f"[init] auto-gestures: {'on (cued by Eva`s own words)' if cuer else 'off'}")
 
     # ---- output canvas: letterbox the render into OWxOH, preserve aspect ----
     # The full-body source sits on black, so black bars are seamless.
@@ -1069,6 +1475,10 @@ def main():
                 listening = voice.user_meter.speaking() and not speaking
                 if scheduler is not None:
                     mouth_delta = renderer.weights_delta(scheduler.weights(speaker.now_ms()))
+                if cuer is not None:
+                    due = cuer.poll(speaker.now_ms())
+                    if due:
+                        renderer.trigger_gesture(due)
             face = renderer.frame(level, speaking, mouth_delta=mouth_delta,
                                   listening=listening)
             sink.submit(face)
