@@ -23,7 +23,10 @@ Reglas para el evento:
 - Si no sabes algo del evento (horarios, ubicación de un stand), sugiere
   preguntar al personal del stand.
 
-<!-- Detalles del evento: completa/corrige estas líneas -->
-- Sede y fechas: POR CONFIRMAR (edita assets/eva_contexto.md).
-- Qué presenta Neto este año: POR CONFIRMAR.
+<!-- Detalles del evento (confirmados desde la base del evento 2026-07-09) -->
+- Evento: **Expo Neto 2026**, 4ª edición, con el tema **"La Nueva Era"**.
+- Sede: **Centro Banamex**, Av. del Conscripto 311, Lomas de Sotelo, CDMX.
+- Fechas: **miércoles 19 y jueves 20 de agosto de 2026**.
+- Hay 83 stands de proveedores expositores, charlas, shows, premiaciones y
+  una cena de gala; la agenda completa la puedes consultar en vivo.
 - Mensajes clave de la dirección: POR CONFIRMAR.

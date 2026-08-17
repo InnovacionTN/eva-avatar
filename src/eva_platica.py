@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import wave
 
 import cv2
 import numpy as np
@@ -64,6 +65,56 @@ MODEL_CANDIDATES = [
 # --------------------------------------------------------------------------
 # audio
 # --------------------------------------------------------------------------
+def _open_audio_stream(sd, kind, device, **kw):
+    """Open an Input/OutputStream at Gemini's fixed rate. Some drivers (p.ej.
+    el audio HDMI del UGREEN, o el UMC202HD via MME en mal momento) rechazan
+    16/24 kHz mono; se cae a WASAPI shared-mode con auto-convert (resamplea el
+    OS) y de ultimo a cualquier dispositivo que si acepte el formato."""
+    cls = sd.InputStream if kind == "input" else sd.OutputStream
+    col = "max_input_channels" if kind == "input" else "max_output_channels"
+    try:
+        return cls(device=device, **kw)
+    except sd.PortAudioError as e:
+        dev_lbl = device if device is not None else "(default)"
+        print(f"[audio] {kind} {dev_lbl} no acepta el formato "
+              f"({str(e).splitlines()[0]}) - buscando alternativa")
+    try:
+        idx = device if device is not None else \
+            sd.default.device[0 if kind == "input" else 1]
+        want = sd.query_devices(idx)["name"]
+    except Exception:
+        want = None
+    # 1) el mismo dispositivo via WASAPI con auto-convert (los nombres MME
+    #    vienen truncados a ~31 chars, compara por prefijo en ambos sentidos)
+    wasapi = next((i for i, h in enumerate(sd.query_hostapis())
+                   if "WASAPI" in h["name"]), None)
+    if wasapi is not None and want:
+        for i, d in enumerate(sd.query_devices()):
+            if d["hostapi"] != wasapi or d[col] <= 0:
+                continue
+            if not (d["name"].startswith(want[:28]) or want.startswith(d["name"][:28])):
+                continue
+            try:
+                s = cls(device=i,
+                        extra_settings=sd.WasapiSettings(auto_convert=True), **kw)
+                print(f"[audio] {kind} via WASAPI auto-convert: [{i}] {d['name']}")
+                return s
+            except Exception:
+                continue
+    # 2) cualquier dispositivo que acepte el formato tal cual (evita loopbacks)
+    for i, d in enumerate(sd.query_devices()):
+        low = d["name"].lower()
+        if d[col] <= 0 or "mezcla" in low or "stereo mix" in low or "loopback" in low:
+            continue
+        try:
+            s = cls(device=i, **kw)
+            print(f"[audio] {kind} fallback: [{i}] {d['name']}")
+            return s
+        except Exception:
+            continue
+    raise RuntimeError(f"ningun dispositivo de {kind} acepta el formato requerido")
+
+
 class SpeakerStream:
     """Plays Gemini's 24 kHz PCM; exposes loudness envelope + an audio clock
     (played/fed milliseconds) that the phoneme scheduler aligns against."""
@@ -75,8 +126,9 @@ class SpeakerStream:
         self._level = 0.0
         self._played = 0  # samples actually sent to the device
         self._fed = 0     # samples received from Gemini
-        self.stream = sd.OutputStream(samplerate=RECV_RATE, channels=1, dtype="int16",
-                                      blocksize=1200, callback=self._callback)
+        self.stream = _open_audio_stream(
+            sd, "output", None, samplerate=RECV_RATE, channels=1, dtype="int16",
+            blocksize=1200, callback=self._callback)
 
     def _callback(self, outdata, frames, time_info, status):
         need = frames * 2
@@ -391,8 +443,9 @@ class MicStream:
         self._dbg_peak = 0.0
         self._dbg_t = time.time()
         self._dbg_sent = 0
-        self.stream = sd.InputStream(samplerate=SEND_RATE, channels=1, dtype="int16",
-                                     blocksize=1600, device=device, callback=self._callback)
+        self.stream = _open_audio_stream(
+            sd, "input", device, samplerate=SEND_RATE, channels=1, dtype="int16",
+            blocksize=1600, callback=self._callback)
 
     def _callback(self, indata, frames, time_info, status):
         rms = float(np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2)))
@@ -458,6 +511,17 @@ class VentasBQ:
                "division": "ca.Division", "categoria": "ca.Categoria",
                "articulo": "ca.Articulo"}
 
+    # ---- SQL libre (consultar_sql): Eva escribe el SELECT, esto lo acota ----
+    ALLOWED_TABLES = {"ventas", "tiendas", "articulos", "tiendas-articulos",
+                      "ventas-transacciones", "formas-pago", "existencias-tdas",
+                      "existencias-cedis", "ordenes_compra", "pedidos", "v_ventas"}
+    MAX_SQL_BYTES = 30 * 1024**3          # techo por consulta (dry-run + billed)
+    MAX_SQL_ROWS = 40
+    _SQL_FORBIDDEN = re.compile(
+        r"\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke"
+        r"|call|execute|begin|commit|rollback|export|load|procedure"
+        r"|information_schema|external_query)\b", re.I)
+
     def __init__(self):
         import json as _json
         from google.oauth2 import service_account
@@ -480,10 +544,48 @@ class VentasBQ:
         self.min_fecha, self.max_fecha = row.mn, row.mx
         print(f"[bq] ventas conectadas (solo lectura): datos del "
               f"{self.min_fecha} al {self.max_fecha}")
+        # contexto del dataset para el system prompt: con esto Eva puede
+        # escribir sus propios SELECTs vía consultar_sql
+        self.schema_doc = f"""\
+ESQUEMA neto-cloud.analitica (BigQuery, SOLO LECTURA). Datos del {self.min_fecha} al {self.max_fecha} (no hay 2024/2025).
+Llaves comunes a casi todo: `Tienda Id`, `Articulo Id`, `Proveedor Id`, Fecha. Los nombres con espacios y las tablas con guion SIEMPRE van entre backticks: v.`Tienda Id`, `neto-cloud.analitica.existencias-tdas`.
+
+Tablas particionadas por Fecha — SIEMPRE filtra WHERE Fecha BETWEEN ... (sin filtro de fecha la consulta se rechaza por cara):
+- ventas: venta diaria por tienda/articulo. Cantidad (piezas), Monto (pesos, con impuestos), `Monto Sin Impuestos`, `Total Costo`, Descuentos, `Tipo Venta`.
+- `ventas-transacciones`: venta por ticket (`Numero Transaccion`); para ticket promedio, canasta, transacciones por dia.
+- `formas-pago`: pagos por ticket: `Tipo Pago` (Efectivo, Tarjeta de Débito/Crédito, Vales, Vales Electrónicos, Transferencia, Cuenta Digital + QR), `Monto Movimiento`, `Hora Movimiento` (0-23).
+- `existencias-tdas` y `existencias-cedis`: inventario diario por tienda(/cedis) y articulo: `Existencia Piezas`, `Existencia Cajas`, `Existencia Costo`. MUY grandes: pide UN solo dia (Fecha = '...').
+- ordenes_compra: compras a proveedores con su ciclo de vida (`Fecha Solicitud`, `Fecha Limite Entrega`, `Fecha Recepción`, `Fecha Pago`; montos/cajas/piezas en etapas Sug/Sol/Surt/Rec; `Estatus Oc`).
+- pedidos: resurtido CEDIS→tienda (`Tienda Solicita Id`, `Tienda Surte Id`; fechas de solicitud/pickeo/embarque/recepción; piezas por etapa; `Estatus Pedido`).
+
+Catálogos (chicos, sin filtro de fecha):
+- tiendas: Tienda, Region, Zona, Estado, Cedis, `Tipo Tienda`, `Indicador Tienda`, `Estatus Tienda` (1=activa).
+- articulos: Articulo, Division, Celula, Categoria, `Sub Categoria`, `Tipo De Marca`, `Estatus Articulo`.
+- `tiendas-articulos`: surtido y precio por tienda-articulo. Es un corte rodante de ~3 dias: filtra fecha = (SELECT MAX(fecha) FROM ...).
+- v_ventas: vista de ventas ya unida con tiendas y articulos — la opcion mas comoda para venta con nombres.
+
+Canales especiales: mayoreo/virtuales/CEDIS (~3% de la venta) ensucian los rankings de tiendas. Para tiendas reales excluye: NOT (t.`Tipo Tienda`='Tienda Especial' OR UPPER(t.Region) LIKE '%ESPECIAL%' OR t.`Indicador Tienda`!='TIENDA').
+Reglas: solo SELECT, agrega siempre (SUM/COUNT/AVG), pide pocas columnas, LIMIT 40 o menos."""
 
     def declaration(self, types):
         S, T = types.Schema, types.Type
-        return types.Tool(function_declarations=[types.FunctionDeclaration(
+        # NON_BLOCKING: el modelo puede seguir hablando (relleno natural)
+        # mientras el query corre; el resultado se inyecta al terminar
+        sql_decl = types.FunctionDeclaration(
+            behavior=types.Behavior.NON_BLOCKING,
+            name="consultar_sql",
+            description=(
+                "Ejecuta un SELECT de BigQuery escrito por ti sobre el dataset "
+                "neto-cloud.analitica (esquema en tu system prompt): inventario, "
+                "tickets, formas de pago, abasto, o cruces que consultar_ventas "
+                "no cubre. Solo SELECT sobre tablas de analitica; filtra SIEMPRE "
+                "por Fecha en las tablas particionadas; agrega y usa LIMIT. Si "
+                "regresa un error, corrige el SQL y reintenta una vez."),
+            parameters=S(type=T.OBJECT, properties={
+                "sql": S(type=T.STRING, description="el SELECT completo (SQL estándar de BigQuery)"),
+            }, required=["sql"]))
+        return types.Tool(function_declarations=[sql_decl, types.FunctionDeclaration(
+            behavior=types.Behavior.NON_BLOCKING,
             name="consultar_ventas",
             description=(
                 "Consulta la venta real de Tiendas Neto (pesos y piezas) por rango "
@@ -573,6 +675,181 @@ class VentasBQ:
             return {"error": f"No pude consultar: {type(e).__name__}. "
                              "Discúlpate brevemente y ofrece intentar de nuevo."}
 
+    def consultar_sql(self, sql=None, **_):
+        """SQL libre escrito por Gemini, con candados: una sola sentencia
+        SELECT, solo tablas de analitica, dry-run con tope de bytes antes de
+        ejecutar, y resultado truncado. Los errores regresan con detalle para
+        que Eva corrija su SQL y reintente."""
+        bq = self.bigquery
+        try:
+            q = str(sql or "").strip().rstrip(";").strip()
+            if not q:
+                return {"error": "consulta vacía"}
+            if ";" in q:
+                return {"error": "solo una sentencia por consulta"}
+            if not re.match(r"^\s*(select|with)\b", q, re.I):
+                return {"error": "solo se permiten consultas SELECT"}
+            if self._SQL_FORBIDDEN.search(q):
+                return {"error": "solo lectura: la consulta usa una operación no permitida"}
+            # cada FROM/JOIN debe apuntar a una tabla permitida de analitica
+            # (o a un CTE definido en la propia consulta)
+            plain = q.replace("`", "")
+            ctes = {m.lower() for m in re.findall(r"\b(\w+)\s+as\s*\(", plain, re.I)}
+            for ref in re.findall(r"\b(?:from|join)\s+([^\s,()]+)", plain, re.I):
+                r = ref.lower()
+                if r in ctes or r.startswith("unnest"):
+                    continue
+                m = re.match(r"^(?:neto-cloud\.)?analitica\.([\w\-]+)$", r)
+                if not m or m.group(1) not in self.ALLOWED_TABLES:
+                    return {"error": f"tabla no permitida: {ref}. Solo el dataset "
+                                     "neto-cloud.analitica (ver esquema)."}
+            # dry-run: estima el escaneo y rechaza consultas caras (casi siempre
+            # significa que faltó el filtro de Fecha en una tabla particionada)
+            est = self.client.query(q, job_config=bq.QueryJobConfig(
+                dry_run=True)).total_bytes_processed or 0
+            if est > self.MAX_SQL_BYTES:
+                return {"error": f"la consulta escanearía {est / 1e9:.0f} GB "
+                                 f"(tope {self.MAX_SQL_BYTES / 1e9:.0f} GB). Acótala "
+                                 "por Fecha (las tablas grandes están particionadas)."}
+            job = self.client.query(q, job_config=bq.QueryJobConfig(
+                maximum_bytes_billed=self.MAX_SQL_BYTES))
+            filas, truncado = [], False
+            for r in job.result(timeout=30):
+                filas.append({k: (float(v) if isinstance(v, (int, float)) else str(v))
+                              for k, v in dict(r).items()})
+                if len(filas) >= self.MAX_SQL_ROWS:
+                    truncado = True
+                    break
+            out = {"filas": filas,
+                   "gb_escaneados": round((job.total_bytes_processed or 0) / 1e9, 2)}
+            if truncado:
+                out["nota"] = f"resultado truncado a {self.MAX_SQL_ROWS} filas"
+            return out
+        except Exception as e:
+            msg = str(e).splitlines()[0][:300]
+            print(f"[bq] error en consultar_sql: {e}", flush=True)
+            return {"error": f"BigQuery: {msg}. Corrige el SQL y reintenta una vez."}
+
+    def dispatch(self, name, args):
+        if name == "consultar_sql":
+            return self.consultar_sql(**args)
+        return self.consultar(**args)
+
+
+# --------------------------------------------------------------------------
+# Insforge (Postgres): base del evento Expo Neto — asistentes, agenda, stands
+# --------------------------------------------------------------------------
+# Mismo patrón que consultar_sql pero contra el Postgres del evento, con
+# solo-lectura triple: la sesión abre con default_transaction_read_only=on,
+# el validador solo deja pasar UN SELECT sobre tablas permitidas, y las
+# columnas sensibles (contacto, cumpleaños, hashes, tokens) están vetadas
+# por regex — Eva no debe compartir datos personales de los asistentes.
+class ExpoDB:
+    ALLOWED_TABLES = {"events", "event_days", "agenda_items", "agenda_kinds",
+                      "talk_speakers", "speakers", "talk_sessions", "stands",
+                      "stand_ratings", "employees", "companies", "regions",
+                      "venues", "rooms", "attendance_log"}
+    MAX_ROWS = 40
+    _FORBIDDEN_COLS = re.compile(
+        r"\b(email|phone|telefono|hash|token|password|secret|access_code"
+        r"|qr_payload|pass_jti|birth|personal|device|slack|photo_key)\w*", re.I)
+
+    def __init__(self):
+        import psycopg
+        self.psycopg = psycopg
+        url = os.environ.get("INSFORGE_DATABASE_URL")
+        if not url:
+            raise RuntimeError("INSFORGE_DATABASE_URL no está en .env")
+        # el endpoint de Insforge solo acepta TLS desde el primer byte
+        # (el SSLRequest clásico de postgres se queda colgado)
+        if "sslnegotiation" not in url:
+            url += ("&" if "?" in url else "?") + "sslnegotiation=direct"
+        self.url = url
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT name, theme, start_date, end_date "
+                        "FROM public.events WHERE is_active LIMIT 1")
+            row = cur.fetchone()
+        ev = f"{row[0]} «{row[1]}» ({row[2]} a {row[3]})" if row else "Expo Neto"
+        print(f"[expo] base del evento conectada (solo lectura): {ev}")
+        self.schema_doc = f"""\
+BASE DEL EVENTO — {ev}. Postgres (Insforge), schema public, SOLO LECTURA. Tablas:
+- events(code,name,edition,theme,start_date,end_date,is_active)
+- event_days(id,event_code,day_date,audience,title,subtitle)
+- agenda_items(id,day_id→event_days.id,starts_at,ends_at,kind,title,description,room_id,points_for_attendance); kind: talk,opening,break,show,reception,expo_tour,closing,award,inauguration,dinner,displacement
+- talk_speakers(agenda_item_id,speaker_id,speaker_order) — une agenda con ponentes
+- speakers(id,full_name,title,area,company,is_external,bio)
+- stands(id,code,name,provider_name,description,category,rating_avg,rating_count,website,is_active) — stands de proveedores expositores
+- stand_ratings(stand_id,stars,comment,created_at)
+- employees(id,full_name,job_title,region,company,active) — asistentes internos. Solo nombre/puesto/región/compañía: correo, teléfono, cumpleaños y códigos están BLOQUEADOS (la consulta se rechaza).
+- companies(code,name) · regions(code,name) · venues(name,address) · rooms(id,name,floor,capacity)
+- attendance_log(user_id→employees.id,agenda_item_id,checked_in_at) — check-ins en vivo
+OJO horarios: starts_at/ends_at ya traen la HORA LOCAL del evento (guardada con etiqueta UTC) — NO conviertas de zona horaria; muestra la hora tal cual con to_char(a.starts_at,'HH24:MI'). Solo SELECT, LIMIT 40 o menos, ILIKE para buscar nombres."""
+
+    def _connect(self):
+        return self.psycopg.connect(
+            self.url, connect_timeout=8,
+            options="-c default_transaction_read_only=on -c statement_timeout=8000")
+
+    def declaration(self, types):
+        S, T = types.Schema, types.Type
+        return types.Tool(function_declarations=[types.FunctionDeclaration(
+            behavior=types.Behavior.NON_BLOCKING,
+            name="consultar_expo",
+            description=(
+                "Ejecuta un SELECT sobre la base del evento (Expo Neto: agenda, "
+                "ponentes, stands, asistentes, salas, check-ins; esquema en tu "
+                "system prompt). Solo SELECT; usa ILIKE '%...%' para nombres. Si "
+                "regresa error, corrige el SQL y reintenta una vez."),
+            parameters=S(type=T.OBJECT, properties={
+                "sql": S(type=T.STRING, description="el SELECT completo (PostgreSQL)"),
+            }, required=["sql"]))])
+
+    def consultar(self, sql=None, **_):
+        try:
+            q = str(sql or "").strip().rstrip(";").strip()
+            if not q:
+                return {"error": "consulta vacía"}
+            if ";" in q:
+                return {"error": "solo una sentencia por consulta"}
+            if not re.match(r"^\s*(select|with)\b", q, re.I):
+                return {"error": "solo se permiten consultas SELECT"}
+            if VentasBQ._SQL_FORBIDDEN.search(q):
+                return {"error": "solo lectura: la consulta usa una operación no permitida"}
+            m = self._FORBIDDEN_COLS.search(q)
+            if m:
+                return {"error": f"columna vetada ({m.group(0)}): no compartas datos "
+                                 "personales; usa solo nombre/puesto/región."}
+            plain = q.replace('"', "")
+            ctes = {c.lower() for c in re.findall(r"\b(\w+)\s+as\s*\(", plain, re.I)}
+            for ref in re.findall(r"\b(?:from|join)\s+([^\s,()]+)", plain, re.I):
+                r = ref.lower()
+                if r in ctes or r.startswith("unnest") or r.startswith("generate_series"):
+                    continue
+                tm = re.match(r"^(?:public\.)?(\w+)$", r)
+                if not tm or tm.group(1) not in self.ALLOWED_TABLES:
+                    return {"error": f"tabla no permitida: {ref} (ver esquema del evento)"}
+            import decimal
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(q)
+                cols = [d.name for d in cur.description]
+                filas, truncado = [], False
+                for row in cur:
+                    filas.append({c: (float(v) if isinstance(v, decimal.Decimal)
+                                      else v if isinstance(v, (int, float, bool))
+                                      else None if v is None else str(v))
+                                  for c, v in zip(cols, row)})
+                    if len(filas) >= self.MAX_ROWS:
+                        truncado = True
+                        break
+            out = {"filas": filas}
+            if truncado:
+                out["nota"] = f"resultado truncado a {self.MAX_ROWS} filas"
+            return out
+        except Exception as e:
+            msg = str(e).splitlines()[0][:300]
+            print(f"[expo] error en consulta: {e}", flush=True)
+            return {"error": f"Postgres: {msg}. Corrige el SQL y reintenta una vez."}
+
 
 # --------------------------------------------------------------------------
 # Gemini Live session (runs on its own asyncio thread)
@@ -580,7 +857,7 @@ class VentasBQ:
 class GeminiVoice(threading.Thread):
     def __init__(self, speaker, model=None, voice=None, allow_barge_in=False,
                  mic_device=None, scheduler=None, cuer=None, ventas=None,
-                 extra_context=None, vision=False, vision_camera=0,
+                 expo=None, extra_context=None, vision=False, vision_camera=0,
                  vision_fps=1.0, debug_audio=False):
         super().__init__(daemon=True)
         self.speaker = speaker
@@ -591,6 +868,7 @@ class GeminiVoice(threading.Thread):
         self.scheduler = scheduler
         self.cuer = cuer
         self.ventas = ventas
+        self.expo = expo
         self.extra_context = extra_context
         self.debug_audio = debug_audio
         self.vision = vision
@@ -599,6 +877,34 @@ class GeminiVoice(threading.Thread):
         self.connected = threading.Event()
         self.fatal = None
         self.user_meter = UserVoiceMeter()
+        # clips de relleno ("déjame checarlo...") con la voz de Eva, generados
+        # por scripts/gen_fillers.py: se reproducen del lado del cliente
+        # mientras corre un query para que no haya silencio muerto — el modelo
+        # NO rellena solo: llama la herramienta y se calla hasta el resultado
+        self.fillers = []
+        if self.ventas is not None or self.expo is not None:
+            for wavp in sorted(glob.glob(os.path.join(
+                    PROJECT_ROOT, "assets", "fillers", "*.wav"))):
+                try:
+                    with wave.open(wavp, "rb") as w:
+                        pcm = w.readframes(w.getnframes())
+                    txtp = wavp[:-4] + ".txt"
+                    text = ""
+                    if os.path.exists(txtp):
+                        with open(txtp, encoding="utf-8") as f:
+                            text = f.read().strip()
+                    self.fillers.append((pcm, text))
+                except Exception as e:
+                    print(f"[init] filler ilegible {wavp}: {e}")
+            if self.fillers:
+                print(f"[init] {len(self.fillers)} clips de relleno cargados")
+
+    def _tool_dispatch(self, name, args):
+        if name == "consultar_expo" and self.expo is not None:
+            return self.expo.consultar(**args)
+        if self.ventas is not None:
+            return self.ventas.dispatch(name, args)
+        return {"error": f"herramienta no disponible: {name}"}
 
     def _client(self):
         from google import genai
@@ -630,11 +936,35 @@ class GeminiVoice(threading.Thread):
                 "de Tiendas Neto (datos diarios por tienda y artículo, del "
                 f"{self.ventas.min_fecha} al {self.ventas.max_fecha}). "
                 "Úsala siempre que te pregunten por ventas, "
-                "cifras o comparativos; nunca inventes números. Antes de consultar di una "
-                "frase breve como 'déjame checarlo'. Al responder, redondea y di las "
+                "cifras o comparativos; nunca inventes números. Mientras la consulta "
+                "corre, el sistema reproduce por ti una frase tipo 'déjame checarlo' — "
+                "tú NO narres la espera: cuando te llegue el resultado da la cifra "
+                "directo, sin decir 'dame un segundo', 'estoy revisando' ni '¡listo!' "
+                "(ese teatro ya sonó). Arranca con la respuesta: 'Mira, ayer "
+                "vendimos...'. Al responder, redondea y di las "
                 "cifras de forma natural ('unos setenta y siete millones de pesos'), "
                 "menciona el periodo, y si piden datos más recientes que "
-                f"{self.ventas.max_fecha}, aclara hasta qué fecha tienes información.")
+                f"{self.ventas.max_fecha}, aclara hasta qué fecha tienes información."
+                "\n\nAdemás tienes consultar_sql para todo lo que consultar_ventas no "
+                "cubre (inventario, tickets, formas de pago, abasto, cruces): tú "
+                "escribes el SELECT usando este esquema. Prefiere consultar_ventas "
+                "para preguntas simples de venta; consultar_sql para lo demás. Si el "
+                "resultado trae 'error', corrige el SQL y reintenta UNA vez; si vuelve "
+                "a fallar, discúlpate con naturalidad.\n\n" + self.ventas.schema_doc)
+        if self.expo is not None:
+            tools = tools or []
+            tools.append(self.expo.declaration(types))
+            prompt += (
+                "\n\nTambién tienes consultar_expo, conectada a la base del evento "
+                "en el que estás presentando: agenda con horarios, ponentes, stands "
+                "de proveedores con calificaciones, asistentes registrados y "
+                "check-ins en vivo. Úsala para cualquier pregunta del evento "
+                "('¿a qué hora es la comida?', '¿dónde está el stand de X?', "
+                "'¿quién da la siguiente charla?', '¿está registrado fulano?'). "
+                "NUNCA compartas datos personales de asistentes (correo, teléfono, "
+                "cumpleaños): solo nombre, puesto y región. Aplica el mismo estilo: "
+                "el sistema pone la frase de espera, tú das la respuesta directa.\n\n"
+                + self.expo.schema_doc)
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=types.Content(parts=[types.Part(text=prompt)]),
@@ -686,24 +1016,52 @@ class GeminiVoice(threading.Thread):
                 await session.send_realtime_input(
                     audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={SEND_RATE}"))
 
+        async def run_tool(fc):
+            # background task: the receive loop keeps playing audio while the
+            # query runs. The model goes silent after calling the tool, so if
+            # the query is still running once Eva's mouth is free we feed a
+            # canned filler clip (her own voice) + its transcript for lip sync.
+            loop_ = asyncio.get_running_loop()
+            args = dict(fc.args or {})
+            print(f"[bq] Eva llama {fc.name}: {args}", flush=True)
+            t0 = time.time()
+            fut = loop_.run_in_executor(
+                None, lambda: self._tool_dispatch(fc.name, args))
+            if self.fillers:
+                filler_done = False
+                while not fut.done() and not filler_done:
+                    await asyncio.sleep(0.35)
+                    if fut.done():
+                        break
+                    if not self.speaker.speaking():
+                        pcm, text = random.choice(self.fillers)
+                        self.speaker.feed(pcm)
+                        now, fed = self.speaker.now_ms(), self.speaker.fed_ms()
+                        if self.scheduler is not None and text:
+                            self.scheduler.on_transcript(text, now, fed)
+                        if self.cuer is not None and text:
+                            self.cuer.on_transcript(text, now, fed)
+                        print(f"[bq] relleno: {text}", flush=True)
+                        filler_done = True
+            result = await fut
+            print(f"[bq] respuesta en {time.time() - t0:.1f}s", flush=True)
+            await session.send_tool_response(function_responses=[
+                types.FunctionResponse(
+                    id=fc.id, name=fc.name, response=result,
+                    scheduling=types.FunctionResponseScheduling.WHEN_IDLE)])
+
         async def receiver():
             got_audio = 0
-            loop_ = asyncio.get_running_loop()
+            tool_tasks = set()
             while True:
                 async for message in session.receive():
                     tc = getattr(message, "tool_call", None)
-                    if tc is not None and self.ventas is not None:
+                    if tc is not None and (self.ventas is not None
+                                           or self.expo is not None):
                         for fc in tc.function_calls:
-                            args = dict(fc.args or {})
-                            print(f"[bq] Eva consulta: {args}", flush=True)
-                            t0 = time.time()
-                            # run in a worker thread: audio keeps flowing meanwhile
-                            result = await loop_.run_in_executor(
-                                None, lambda a=args: self.ventas.consultar(**a))
-                            print(f"[bq] respuesta en {time.time() - t0:.1f}s", flush=True)
-                            await session.send_tool_response(function_responses=[
-                                types.FunctionResponse(id=fc.id, name=fc.name,
-                                                       response=result)])
+                            task = asyncio.create_task(run_tool(fc))
+                            tool_tasks.add(task)
+                            task.add_done_callback(tool_tasks.discard)
                         continue
                     sc = getattr(message, "server_content", None)
                     if sc is not None and getattr(sc, "interrupted", False):
@@ -731,16 +1089,53 @@ class GeminiVoice(threading.Thread):
                                 self.cuer.on_transcript(tr.text, now, fed)
 
         async def vision_sender():
-            cap = cv2.VideoCapture(self.vision_camera, cv2.CAP_DSHOW)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            if not cap.isOpened():
+            # MSMF primero: el capturador HDMI UGREEN entrega "No Signal" negro
+            # por DirectShow pero funciona bien por Media Foundation con MJPG a
+            # su resolucion nativa 1080p. DSHOW queda de fallback (webcams).
+            cap = None
+            for backend, bname in ((cv2.CAP_MSMF, "MSMF"), (cv2.CAP_DSHOW, "DSHOW")):
+                c = cv2.VideoCapture(self.vision_camera, backend)
+                if not c.isOpened():
+                    c.release()
+                    continue
+                c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                c.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                c.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                # calienta y verifica que los frames no vengan negros (sin señal)
+                bright = 0.0
+                for _ in range(20):
+                    ok, frame = c.read()
+                    if ok:
+                        bright = max(bright, float(frame.mean()))
+                        if bright > 8.0:
+                            break
+                    await asyncio.sleep(0.05)
+                if bright > 8.0:
+                    print(f"[vision] camara {self.vision_camera} via {bname} OK")
+                    cap = c
+                    break
+                print(f"[vision] camara {self.vision_camera} via {bname}: frames "
+                      "negros (¿sin señal HDMI?) - probando otro backend")
+                c.release()
+            if cap is None:
                 print("[vision] camera not available - continuing without sight")
                 return
             print("[vision] camera streaming to Gemini (~1 fps)")
+            dark = 0
             try:
                 while True:
                     ok, frame = cap.read()
+                    if ok and frame.mean() < 3.0:
+                        # no le mandes frames negros a Gemini: alucina lo que "ve"
+                        dark += 1
+                        if dark == 5:
+                            print("[vision] AVISO: la camara manda frames negros "
+                                  "(¿se perdio la señal HDMI?) - Eva no esta viendo")
+                        ok = False
+                    elif ok:
+                        if dark >= 5:
+                            print("[vision] señal recuperada - Eva ya ve de nuevo")
+                        dark = 0
                     if ok:
                         h, w = frame.shape[:2]
                         if w > 768:
@@ -770,7 +1165,8 @@ class OutputSink(threading.Thread):
     """Compose + virtual-cam send + preview on their own thread so the GPU
     render loop never waits on them."""
 
-    def __init__(self, cam, preview, canvas_base, dst_w, dst_h, x_off, y_off, key_cb=None):
+    def __init__(self, cam, preview, canvas_base, dst_w, dst_h, x_off, y_off, key_cb=None,
+                 stretch=False):
         super().__init__(daemon=True)
         self.cam = cam
         self.preview = preview
@@ -778,6 +1174,7 @@ class OutputSink(threading.Thread):
         self.dst_w, self.dst_h = dst_w, dst_h
         self.x_off, self.y_off = x_off, y_off
         self.key_cb = key_cb
+        self.stretch = stretch
         self.cond = threading.Condition()
         self.face = None
         self.running = True
@@ -789,6 +1186,18 @@ class OutputSink(threading.Thread):
             self.cond.notify()
 
     def run(self):
+        if self.preview:
+            # resizable + keep-ratio: un lienzo vertical (tótem, 1536 de alto)
+            # no cabe en una laptop con ventana AUTOSIZE y se compartiría cortado.
+            # stretch (LED film): FREERATIO deforma el lienzo a toda la pantalla —
+            # el controlador del LED re-escala el 1080p al panel y lo compensa.
+            ratio = cv2.WINDOW_FREERATIO if self.stretch else cv2.WINDOW_KEEPRATIO
+            cv2.namedWindow("Eva platica", cv2.WINDOW_NORMAL | ratio)
+            ch, cw = self.canvas_base.shape[:2]
+            if ch > 900:
+                cv2.resizeWindow("Eva platica", int(cw * 900 / ch), 900)
+            else:
+                cv2.resizeWindow("Eva platica", cw, ch)
         while self.running:
             with self.cond:
                 while self.face is None and self.running:
@@ -806,6 +1215,14 @@ class OutputSink(threading.Thread):
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     self.quit_requested = True
+                elif key == ord("f"):
+                    # fullscreen sin bordes en el monitor donde esté la ventana
+                    # (arrastra la ventana al tótem/HDMI y presiona f)
+                    self._fullscreen = not getattr(self, "_fullscreen", False)
+                    cv2.setWindowProperty(
+                        "Eva platica", cv2.WND_PROP_FULLSCREEN,
+                        cv2.WINDOW_FULLSCREEN if self._fullscreen
+                        else cv2.WINDOW_NORMAL)
                 elif key != 255 and self.key_cb is not None:
                     self.key_cb(key)
         if self.preview:
@@ -921,9 +1338,14 @@ class EvaRenderer:
             gy, gx = self.torch.meshgrid(ys, xs, indexing="ij")
             self.bm_base = self.torch.stack((gx, gy), dim=-1).unsqueeze(0)  # 1,H,W,2
             row = self.torch.linspace(0.0, 1.0, H, device=dev)             # 0 top .. 1 bottom
-            # sway weight: 1 from the head down to the shoulders, then ramps to
+            # smoothstep: C1 ramps everywhere — linear ramps put a visible
+            # crease exactly at the hip/shoulder lines where their slope breaks
+            def _ss(t):
+                return t * t * (3.0 - 2.0 * t)
+
+            # sway weight: 1 from the head down to the shoulders, then eases to
             # 0 at the hip line; 0 below (legs/feet stay planted)
-            w = self.torch.clamp((hip_y - row) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0)
+            w = _ss(self.torch.clamp((hip_y - row) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0))
             w = self.torch.where(row < shoulder_y, self.torch.ones_like(w), w)
             self.bm_sway_w = w.view(1, H, 1)
             # breathing weight: a soft bump centered on the chest
@@ -935,28 +1357,34 @@ class EvaRenderer:
             # weight-shift: hips carry the most lateral motion, the legs lean
             # with them down to the ankles (feet stay planted), and the torso
             # above follows partially — the classic standing weight shift
-            upper = 0.3 + 0.7 * self.torch.clamp(
-                (row - shoulder_y) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0)
-            lower = self.torch.clamp((ankle_y - row) / max(1e-3, ankle_y - hip_y), 0.0, 1.0)
+            upper = 0.3 + 0.7 * _ss(self.torch.clamp(
+                (row - shoulder_y) / max(1e-3, hip_y - shoulder_y), 0.0, 1.0))
+            lower = _ss(self.torch.clamp(
+                (ankle_y - row) / max(1e-3, ankle_y - hip_y), 0.0, 1.0))
             self.bm_shift_w = self.torch.where(row <= hip_y, upper, lower).view(1, H, 1)
             # postural sway: a standing body is an inverted pendulum pivoting at
-            # the ankles — displacement grows linearly from 0 at the ankles to
-            # max at the head, so the legs themselves are never fully frozen
-            self.bm_pend_w = self.torch.clamp(
-                (ankle_y - row) / max(1e-3, ankle_y), 0.0, 1.0).view(1, H, 1)
+            # the ankles — displacement grows from 0 at the ankles to max at the
+            # head, so the legs themselves are never fully frozen
+            self.bm_pend_w = _ss(self.torch.clamp(
+                (ankle_y - row) / max(1e-3, ankle_y), 0.0, 1.0)).view(1, H, 1)
             # counter-balance: when the shoulders lean one way the hips push the
-            # other way — peak at the hips, fading to 0 at the ankles
-            self.bm_counter_w = self.torch.where(
-                row > hip_y, lower, self.torch.zeros_like(row)).view(1, H, 1)
+            # other way — a soft bump peaking just below the hips that fades in
+            # smoothly (a hard cutoff at the hip line reads as a tear) and dies
+            # toward the ankles
+            thigh_y = hip_y + 0.10
+            self.bm_counter_w = (self.torch.exp(-0.5 * ((row - thigh_y) / 0.12) ** 2)
+                                 * lower).view(1, H, 1)
             # contrapposto hip hike: resting weight on one leg lifts that hip and
-            # drops the other — a column-signed vertical shear in a band around
-            # the hip line (gx is -1 at the left edge, +1 at the right)
-            hip_band = self.torch.exp(-0.5 * ((row - hip_y) / 0.09) ** 2).view(1, H, 1)
+            # drops the other — a column-signed vertical shear in a wide band
+            # around the hip line (gx is -1 at the left edge, +1 at the right);
+            # too narrow a band folds the waistline like a hinge
+            hip_band = self.torch.exp(-0.5 * ((row - hip_y) / 0.14) ** 2).view(1, H, 1)
             self.bm_hiptilt_w = hip_band * gx.unsqueeze(0)  # (1,H,W)
             # settle dip: shifting weight bends the knees, so everything above
             # them drops a touch during the transition (ramps to 0 at the ankles)
             knee_y = 0.5 * (hip_y + ankle_y)
-            dip_lower = self.torch.clamp((ankle_y - row) / max(1e-3, ankle_y - knee_y), 0.0, 1.0)
+            dip_lower = _ss(self.torch.clamp(
+                (ankle_y - row) / max(1e-3, ankle_y - knee_y), 0.0, 1.0))
             self.bm_dip_w = self.torch.where(row < knee_y, self.torch.ones_like(w),
                                              dip_lower).view(1, H, 1)
             # weight-shift state: a slow random walk, not a metronome — a new
@@ -1238,7 +1666,7 @@ class EvaRenderer:
         pend_dx = float(pend_px) * 2.0 / self.bm_W
         # contrapposto: the loaded hip rides up (and the other drops) with the
         # weight shift; sign comes from the column-signed hip-tilt map
-        tilt_px = L * self.ws_gain * 3.5 * (self.ws_cur + 0.5 * ws_idle)
+        tilt_px = L * self.ws_gain * 2.2 * (self.ws_cur + 0.5 * ws_idle)
         tilt_dy = -float(tilt_px) * 2.0 / self.bm_H
         # knee-breath: the whole body above the knees rises a touch on inhale
         settle_dy = -float(L * 1.1 * breath) * 2.0 / self.bm_H
@@ -1253,8 +1681,10 @@ class EvaRenderer:
               - settle_dy * self.bm_dip_w)
         grid = self.torch.stack((gx, gy), dim=-1)
         img = out.permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
+        # padding "border" replica el pixel del borde: con fondo negro da negro
+        # (igual que antes) y con fondo blanco da blanco — sin filos oscuros
         warped = self.F.grid_sample(img, grid, mode="bilinear",
-                                    padding_mode="zeros", align_corners=True)
+                                    padding_mode="border", align_corners=True)
         return warped.squeeze(0).permute(1, 2, 0)
 
 
@@ -1312,6 +1742,50 @@ def run_check(args):
     print(f"[check] OK: {model} returned {secs:.1f}s of audio -> {wav_path}")
 
 
+def list_video_devices():
+    """DirectShow capture devices, in the same index order cv2.CAP_DSHOW uses.
+    Returns a list of names, or None if pygrabber is not installed."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        return FilterGraph().get_input_devices()
+    except Exception:
+        return None
+
+
+def resolve_camera(spec):
+    """Accept a device index ('1') or a partial name ('ugreen') and return
+    the DirectShow index for cv2.VideoCapture."""
+    s = str(spec).strip()
+    if s.isdigit():
+        return int(s)
+    names = list_video_devices()
+    if names is None:
+        print(f"[vision] can't resolve camera '{s}' by name (pip install pygrabber) - using 0")
+        return 0
+    for i, n in enumerate(names):
+        if s.lower() in n.lower():
+            print(f"[vision] camera '{s}' -> [{i}] {n}")
+            return i
+    print(f"[vision] no camera matches '{s}' - available: "
+          + ", ".join(f"[{i}] {n}" for i, n in enumerate(names)) + " - using 0")
+    return 0
+
+
+def resolve_mic(spec):
+    """Accept an input device index ('3') or a partial name ('umc') and return
+    the sounddevice index (first match; MME entries come first)."""
+    s = str(spec).strip()
+    if s.isdigit():
+        return int(s)
+    import sounddevice as sd
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and s.lower() in d["name"].lower():
+            print(f"[mic] '{s}' -> [{i}] {d['name']}")
+            return i
+    print(f"[mic] ningun microfono coincide con '{s}' - usando el default del sistema")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=SOURCE_IMAGE)
@@ -1320,7 +1794,11 @@ def main():
     ap.add_argument("--mic-device", default=None, help="sounddevice input index/name")
     ap.add_argument("--vision", action="store_true",
                     help="stream the webcam to Gemini so Eva can see")
-    ap.add_argument("--vision-camera", type=int, default=0)
+    ap.add_argument("--vision-camera", default="0",
+                    help="camera index or partial device name (ej. 'ugreen' para la USB); "
+                         "usa --list-cameras para ver las opciones")
+    ap.add_argument("--list-cameras", action="store_true",
+                    help="list video capture devices and exit")
     ap.add_argument("--vision-fps", type=float, default=1.0)
     ap.add_argument("--allow-barge-in", action="store_true",
                     help="keep the mic open while Eva speaks (use headphones!)")
@@ -1365,8 +1843,13 @@ def main():
                          "(ej. Expo Neto 2026); se omite si no existe")
     ap.add_argument("--no-bigquery", action="store_true",
                     help="desactiva la herramienta consultar_ventas (BigQuery)")
+    ap.add_argument("--no-expo", action="store_true",
+                    help="desactiva la herramienta consultar_expo (base del evento)")
     ap.add_argument("--no-pasteback", action="store_true")
     ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--stretch", action="store_true",
+                    help="en fullscreen deforma el lienzo a toda la pantalla (para "
+                         "LED film cuyo controlador escala el 1080p completo al panel)")
     ap.add_argument("--no-virtual-cam", action="store_true")
     ap.add_argument("--check", action="store_true", help="connectivity test only, no avatar")
     ap.add_argument("--mute", action="store_true", help="render avatar without Gemini (lip test)")
@@ -1374,6 +1857,18 @@ def main():
                     help="log mic level + whether Gemini is replying (diagnose 'she doesn't answer')")
     ap.add_argument("--max-frames", type=int, default=0, help="exit after N frames (testing)")
     args = ap.parse_args()
+
+    if args.list_cameras:
+        names = list_video_devices()
+        if names is None:
+            print("[vision] pygrabber no instalado - no puedo listar nombres "
+                  "(pip install pygrabber)")
+        elif not names:
+            print("[vision] no se detectaron camaras")
+        else:
+            for i, n in enumerate(names):
+                print(f"  [{i}] {n}")
+        return
 
     if args.check:
         run_check(args)
@@ -1415,14 +1910,22 @@ def main():
             except Exception as e:
                 print(f"[bq] sin BigQuery ({type(e).__name__}: {e}) - Eva no podrá "
                       "consultar ventas")
+        expo = None
+        if not args.no_expo:
+            try:
+                expo = ExpoDB()
+            except Exception as e:
+                print(f"[expo] sin base del evento ({type(e).__name__}: {e}) - Eva "
+                      "no podrá consultar agenda/asistentes")
         mic_dev = None
         if args.mic_device is not None:
-            mic_dev = int(args.mic_device) if args.mic_device.isdigit() else args.mic_device
+            mic_dev = resolve_mic(args.mic_device)
         voice = GeminiVoice(speaker, model=args.model, voice=args.voice,
                             allow_barge_in=args.allow_barge_in, mic_device=mic_dev,
                             scheduler=scheduler, cuer=cuer, ventas=ventas,
-                            extra_context=extra_context, vision=args.vision,
-                            vision_camera=args.vision_camera, vision_fps=args.vision_fps,
+                            expo=expo, extra_context=extra_context, vision=args.vision,
+                            vision_camera=resolve_camera(args.vision_camera),
+                            vision_fps=args.vision_fps,
                             debug_audio=args.debug_audio)
         voice.start()
         voice.connected.wait(timeout=60)
@@ -1432,13 +1935,17 @@ def main():
         print(f"[init] auto-gestures: {'on (cued by Eva`s own words)' if cuer else 'off'}")
 
     # ---- output canvas: letterbox the render into OWxOH, preserve aspect ----
-    # The full-body source sits on black, so black bars are seamless.
+    # Las barras toman el color del fondo de la fuente (promedio de las 4
+    # esquinas): negras con fondo negro, blancas con fondo blanco — seamless.
     OW, OH = args.out_width, args.out_height
     fh, fw = renderer.src_rgb.shape[:2]
     scale = min(OW / fw, OH / fh)
     dst_w, dst_h = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
     x_off, y_off = (OW - dst_w) // 2, (OH - dst_h) // 2
-    canvas_base = np.zeros((OH, OW, 3), dtype=np.uint8)
+    corners = np.stack([renderer.src_rgb[0, 0], renderer.src_rgb[0, -1],
+                        renderer.src_rgb[-1, 0], renderer.src_rgb[-1, -1]])
+    canvas_base = np.full((OH, OW, 3), corners.mean(axis=0).astype(np.uint8),
+                          dtype=np.uint8)
 
     cam = None
     if not args.no_virtual_cam:
@@ -1448,7 +1955,7 @@ def main():
         print(f"[init] virtual camera: {cam.device} {OW}x{OH}@{args.fps}")
 
     sink = OutputSink(cam, args.preview, canvas_base, dst_w, dst_h, x_off, y_off,
-                      key_cb=renderer.trigger_gesture_by_key)
+                      key_cb=renderer.trigger_gesture_by_key, stretch=args.stretch)
     sink.start()
     if args.preview:
         print("[keys] focus the preview window, then: n=nod (sí)  m=shake (no)  "
